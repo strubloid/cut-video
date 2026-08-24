@@ -21,6 +21,8 @@ source "$CUT_VIDEO_ROOT/components/review.sh"
 source "$CUT_VIDEO_ROOT/components/finalize.sh"
 
 function dnd-cut() {
+  trap 'dnd-pause-on-exit' EXIT
+
   if [[ $# -lt 1 ]]; then
     dnd-err "Usage: dnd-cut <video-file>"
     return 1
@@ -44,7 +46,7 @@ function dnd-cut() {
   export DND_ERROR_LOG="$ws/logs/error.log"
   : > "$DND_LOG_FILE"
 
-  trap 'dnd-err "Interrupted (line ${LINENO:-?}, exit=$?). Workspace preserved -- see $DND_LOG_FILE and $DND_ERROR_LOG. Re-run to resume."; return 130' INT TERM
+  trap 'dnd-on-interrupt $?' INT TERM
 
   dnd-log "=== dnd-cut run start ==="
   dnd-log "Workspace: $ws"
@@ -102,11 +104,6 @@ function dnd-cut() {
   dnd-render-final "$ws" "$input"
 
   dnd-print-summary "$ws" "$input"
-
-  if [[ "${DND_NO_PAUSE:-0}" != "1" && -t 0 ]]; then
-    printf '\n' >&2
-    read -rp "[dnd] Press enter to exit... (set DND_NO_PAUSE=1 to skip) " </dev/tty || true
-  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

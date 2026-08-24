@@ -47,3 +47,25 @@ function dnd-valid-json() {
   [[ -f "$p" ]] || return 1
   jq empty "$p" >/dev/null 2>&1
 }
+
+function dnd-on-interrupt() {
+  local rc="${1:-130}"
+  dnd-err "Interrupted (line ${LINENO:-?}, exit=$rc). Workspace preserved -- see $DND_LOG_FILE and $DND_ERROR_LOG. Re-run to resume."
+  exit 130
+}
+
+function dnd-pause-on-exit() {
+  local rc=$?
+  if [[ $rc -ne 0 && $rc -ne 130 ]]; then
+    if [[ -n "${DND_ERROR_LOG:-}" && -s "$DND_ERROR_LOG" ]]; then
+      dnd-err "Script exited with status $rc. See $DND_ERROR_LOG for details."
+    else
+      dnd-err "Script exited with status $rc. See output above for details."
+    fi
+  fi
+  if [[ "${DND_NO_PAUSE:-0}" == "1" || ! -t 0 ]]; then
+    return 0
+  fi
+  printf '\n' >&2
+  read -rp "[dnd] Press enter to exit... (set DND_NO_PAUSE=1 to skip) " </dev/tty || true
+}

@@ -30,9 +30,27 @@ function dnd-interactive-review() {
 
   dnd-log "Manual review starts: $total segment(s) require attention."
 
+  if [[ ! -t 0 ]] && ! { : < /dev/tty; } 2>/dev/null; then
+    dnd-warn "No interactive terminal detected; auto-marking all $total questionable segment(s) as 'remove'."
+    local segid
+    while IFS=$'\t' read -r segid _s _e _c _reason; do
+      [[ "$segid" =~ ^[0-9]+$ ]] || continue
+      dnd-decisions-append "$ws" "$segid" "remove"
+      printf '%s segment=%d decision=remove (auto: no tty)\n' \
+        "$(date -Iseconds)" "$segid" >> "$review_log"
+    done < <(jq -r '.questionable[] | "\(.id)\t\(.start)\t\(.end)\t\(.speech_confidence)\t\(.reason)"' "$plan_json")
+    return 0
+  fi
+
   local i=0
   while IFS=$'\t' read -r segid s e conf reason; do
     i=$((i + 1))
+
+    if ! [[ "$segid" =~ ^[0-9]+$ ]]; then
+      dnd-warn "[$i/$total] Skipping malformed entry (id='$segid')."
+      continue
+    fi
+
     local segfile
     segfile=$(printf 'segment-%03d.mp4' "$((segid + 1))")
 
@@ -44,11 +62,11 @@ function dnd-interactive-review() {
     fi
 
     local ts_start ts_end
-    ts_start=$(dnd-format-ts "$s")
-    ts_end=$(dnd-format-ts "$e")
+    ts_start=$(dnd-format-ts "${s:-0}")
+    ts_end=$(dnd-format-ts "${e:-0}")
 
     printf '\n'
-    dnd-log "[$i/$total]  segment=$segid  $ts_start -> $ts_end  ($(awk -v s="$s" -v e="$e" 'BEGIN{printf "%.2f", e-s}')s, conf=$conf)"
+    dnd-log "[$i/$total]  segment=$segid  $ts_start -> $ts_end  ($(awk -v s="${s:-0}" -v e="${e:-0}" 'BEGIN{printf "%.2f", e-s}')s, conf=$conf)"
     dnd-log "         reason: $reason"
     dnd-log "         file:   leftovers/$segfile"
 
@@ -64,7 +82,12 @@ function dnd-interactive-review() {
     fi
 
     while true; do
-      read -r -n 1 -p "[dnd] [r]estore  [k]eep removed  [p]lay again  [s]kip  [q]uit? " choice
+      if ! read -r -n 1 -p "[dnd] [r]estore  [k]eep removed  [p]lay again  [s]kip  [q]uit? " choice < /dev/tty; then
+        dnd-warn "Input closed; treating as 'skip' for this segment."
+        printf '%s segment=%d decision=skip (auto: input closed)\n' \
+          "$(date -Iseconds)" "$segid" >> "$review_log"
+        break
+      fi
       echo
       case "$choice" in
         r) dnd-decisions-append "$ws" "$segid" "restore"
