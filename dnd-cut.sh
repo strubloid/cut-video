@@ -15,9 +15,6 @@ source "$CUT_VIDEO_ROOT/components/vad.sh"
 source "$CUT_VIDEO_ROOT/components/whisper.sh"
 source "$CUT_VIDEO_ROOT/components/timeline.sh"
 source "$CUT_VIDEO_ROOT/components/renderer.sh"
-source "$CUT_VIDEO_ROOT/components/leftovers.sh"
-source "$CUT_VIDEO_ROOT/components/decisions.sh"
-source "$CUT_VIDEO_ROOT/components/review.sh"
 source "$CUT_VIDEO_ROOT/components/finalize.sh"
 
 function dnd-cut() {
@@ -86,22 +83,7 @@ function dnd-cut() {
 
   local plan_json="$ws/analysis/timeline.json"
 
-  if [[ ! -f "$ws/candidate-final.mp4" ]]; then
-    dnd-render-from-plan "$input" "$ws/candidate-final.mp4" "$plan_json"
-  fi
-
-  if [[ ! -d "$ws/leftovers" ]] || [[ -z "$(ls -A "$ws/leftovers" 2>/dev/null)" ]]; then
-    dnd-extract-leftovers "$ws" "$input"
-  fi
-
-  dnd-interactive-review "$ws"
-  if [[ "${DND_QUIT_REQUESTED:-0}" == "1" ]]; then
-    dnd-log "Quit requested during review. Workspace preserved at $ws -- re-run to resume."
-    return 0
-  fi
-
-  dnd-reconstruct-plan "$ws"
-  dnd-render-final "$ws" "$input"
+  dnd-render-from-plan "$input" "$ws/final.mp4" "$plan_json"
 
   dnd-print-summary "$ws" "$input"
 }

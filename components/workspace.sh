@@ -11,13 +11,12 @@ function dnd-workspace-path() {
 
 function dnd-workspace-init() {
   local ws="$1"
-  mkdir -p "$ws/analysis" "$ws/leftovers" "$ws/segments" "$ws/review" "$ws/logs"
-  : > "$ws/review/review.log"
+  mkdir -p "$ws/analysis" "$ws/logs"
 }
 
 function dnd-has-state() {
   local ws="$1"
-  [[ -f "$ws/analysis/audio.json" || -f "$ws/decisions.json" ]]
+  [[ -f "$ws/analysis/audio.json" || -f "$ws/analysis/timeline.json" ]]
 }
 
 function dnd-resume-prompt() {
@@ -28,9 +27,9 @@ function dnd-resume-prompt() {
 
   if [[ -z "${choice:-}" ]]; then
     dnd-log "Existing workspace detected: $ws"
-    dnd-log "  [r] Resume (reuse analysis + decisions)"
-    dnd-log "  [t] Rebuild timeline (keep audio/VAD/Whisper, rebuild cuts)"
-    dnd-log "  [a] Re-analyze (keep workspace, redo audio/VAD/Whisper)"
+    dnd-log "  [r] Resume (reuse analysis + timeline, just re-render)"
+    dnd-log "  [t] Rebuild timeline (keep audio/VAD/Whisper, rebuild timeline + render)"
+    dnd-log "  [a] Re-analyze (keep workspace, redo audio/VAD/Whisper + timeline + render)"
     dnd-log "  [f] Fresh start (wipe workspace)"
     while true; do
       read -r -n 1 -p "[dnd] Choose [r=Resume, t=Rebuild timeline, a=Re-analyze, f=Fresh start]: " choice
@@ -44,15 +43,10 @@ function dnd-resume-prompt() {
 
   case "$choice" in
     r) dnd-log "Resuming."; printf 'resume\n'; return 0 ;;
-    t) rm -f "$ws/decisions.json" "$ws/candidate-final.mp4" "$ws/final.mp4" "$ws/analysis/timeline.json" "$ws/analysis/final-plan.json"
-       rm -rf "$ws/leftovers" "$ws/segments"
-       mkdir -p "$ws/leftovers" "$ws/segments"
+    t) rm -f "$ws/final.mp4" "$ws/analysis/timeline.json"
        dnd-log "Rebuilding timeline from existing analysis."; printf 'rebuild-timeline\n'; return 0 ;;
-    a) rm -f "$ws/decisions.json" "$ws/candidate-final.mp4" "$ws/final.mp4" \
-          "$ws/analysis/timeline.json" "$ws/analysis/final-plan.json" \
+    a) rm -f "$ws/final.mp4" "$ws/analysis/timeline.json" \
           "$ws/analysis/audio.wav" "$ws/analysis/vad.json" "$ws/analysis/audio.json"
-       rm -rf "$ws/leftovers" "$ws/segments"
-       mkdir -p "$ws/leftovers" "$ws/segments"
        dnd-log "Re-running analysis."; printf 'reanalyze\n'; return 0 ;;
     f) dnd-log "Wiping workspace."; rm -rf "$ws"; dnd-workspace-init "$ws"
        printf 'fresh\n'; return 0 ;;
