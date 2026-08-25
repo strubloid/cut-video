@@ -14,11 +14,12 @@ source "$CUT_VIDEO_ROOT/components/audio.sh"
 source "$CUT_VIDEO_ROOT/components/vad.sh"
 source "$CUT_VIDEO_ROOT/components/whisper.sh"
 source "$CUT_VIDEO_ROOT/components/timeline.sh"
+source "$CUT_VIDEO_ROOT/components/refine.sh"
 source "$CUT_VIDEO_ROOT/components/renderer.sh"
 source "$CUT_VIDEO_ROOT/components/finalize.sh"
 
 function dnd-cut() {
-  trap 'dnd-pause-on-exit' EXIT
+  trap 'dnd-render-cleanup; dnd-pause-on-exit' EXIT
 
   if [[ $# -lt 1 ]]; then
     dnd-err "Usage: dnd-cut <video-file>"
@@ -81,7 +82,12 @@ function dnd-cut() {
     dnd-build-timeline "$ws" "$duration"
   fi
 
-  local plan_json="$ws/analysis/timeline.json"
+  local plan_json="$ws/analysis/timeline.refined.json"
+  if [[ "$mode" == "resume" ]] && dnd-valid-json "$plan_json"; then
+    dnd-log "Reusing existing refined timeline."
+  else
+    dnd-refine-cuts "$ws" "$input"
+  fi
 
   dnd-render-from-plan "$input" "$ws/final.mp4" "$plan_json"
 
