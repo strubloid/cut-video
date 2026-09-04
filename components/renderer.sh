@@ -1,13 +1,38 @@
 #!/bin/bash
 
-DND_RENDER_PIDS=()
-DND_SEG_DIR=""
-DND_CHUNK_DIR=""
-DND_TAILER_PID=""
-DND_PROG_FILE=""
-
 function dnd-detect-nvenc() {
-  ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE '^\s*V[\.\w]*\s+h264_nvenc'
+  ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE '^[[:space:]]*V[\.a-zA-Z0-9]*[[:space:]]+h264_nvenc[[:space:]]'
+}
+
+function dnd-detect-vaapi() {
+  ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE '^[[:space:]]*V[\.a-zA-Z0-9]*[[:space:]]+h264_vaapi[[:space:]]'
+}
+
+function dnd-can-encode() {
+  local enc="$1"
+  local w=256 h=256
+  if [[ "$enc" == "h264_nvenc" || "$enc" == "h264_vaapi" ]]; then
+    w=256 h=256
+  fi
+  if ffmpeg -y -nostdin -loglevel error \
+        -f lavfi -i "color=c=black:s=${w}x${h}:d=1:r=30" \
+        -c:v "$enc" -frames:v 1 -f null - >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+function dnd-pick-encoder() {
+  if [[ -n "${DND_FORCE_CPU:-}" ]]; then
+    echo "libx264"; return
+  fi
+  if dnd-detect-nvenc && dnd-can-encode h264_nvenc; then
+    echo "h264_nvenc"; return
+  fi
+  if dnd-detect-vaapi && dnd-can-encode h264_vaapi; then
+    echo "h264_vaapi"; return
+  fi
+  echo "libx264"
 }
 
 function dnd-render-from-plan() {
@@ -19,52 +44,68 @@ function dnd-render-from-plan() {
   keep_count=$(jq '[.timeline[] | select(.action=="keep")] | length' "$plan_json")
 
   if [[ "$keep_count" -eq 0 ]]; then
-    dnd-warn "Nothing to keep -- entire timeline marked remove. Copying original as fallback."
-    dnd-warn "If this was unintended, edit the timeline.json in the workspace and re-run with [t]."
-    cp -p "$input" "$output"
-    return 0
+    dnd-err "Nothing to keep -- entire timeline marked remove. Aborting render."
+    dnd-err "If this was unintended, edit the timeline.json in the workspace and re-run with [t]."
+    return 1
   fi
 
   local ws_dir
   ws_dir="$(dirname "$output")"
-  local seg_dir="${DND_SEG_DIR:-$ws_dir/.segments}"
-  local chunk_dir="$ws_dir/.chunks"
-  mkdir -p "$seg_dir" "$chunk_dir"
-  rm -f "$chunk_dir"/chunk_*.mp4 "$chunk_dir"/concat.txt 2>/dev/null
-  DND_SEG_DIR="$seg_dir"
-  DND_CHUNK_DIR="$chunk_dir"
+  local piece_dir="$ws_dir/.pieces"
+  mkdir -p "$piece_dir"
+  rm -f "$piece_dir/concat.txt" 2>/dev/null
 
-  local use_gpu="off"
-  if [[ "${DND_USE_GPU:-auto}" == "auto" ]]; then
-    if dnd-detect-nvenc; then use_gpu="nvenc"; fi
-  elif [[ "${DND_USE_GPU}" == "on" || "${DND_USE_GPU}" == "nvenc" ]]; then
-    if dnd-detect-nvenc; then use_gpu="nvenc"; else dnd-warn "DND_USE_GPU=on but h264_nvenc not available; falling back to libx264"; fi
-  fi
-
-  local video_codec="libx264"
-  local video_preset="veryfast"
-  local quality_flag=(-crf "$DND_VIDEO_CRF")
-  if [[ "$use_gpu" == "nvenc" ]]; then
-    video_codec="h264_nvenc"
-    video_preset="fast"
-    quality_flag=(-cq "$DND_VIDEO_CRF" -b:v 0)
-    dnd-log "GPU: NVENC detected, using h264_nvenc -preset fast -cq $DND_VIDEO_CRF"
+  local local_input="$input"
+  local local_copy="$piece_dir/.source.mp4"
+  if [[ ! -f "$local_copy" ]]; then
+    dnd-log "Copying source to local working dir for fast I/O..."
+    if cp -p "$input" "$local_copy" 2>/dev/null && [[ -s "$local_copy" ]]; then
+      local_input="$local_copy"
+      dnd-log "Source copied: $(du -h "$local_copy" | cut -f1)"
+    else
+      dnd-warn "Could not stage source locally; rendering directly from '$input'"
+      rm -f "$local_copy"
+    fi
   else
-    dnd-log "GPU: none, using libx264 -preset veryfast -crf $DND_VIDEO_CRF"
+    local_input="$local_copy"
+    dnd-log "Reusing staged source: $local_copy"
   fi
 
-  dnd-log "Re-encoding $keep_count keep-segments frame-accurately into $seg_dir ..."
+  local enc_args enc_name enc_choice
+  enc_choice=$(dnd-pick-encoder)
+  case "$enc_choice" in
+    h264_nvenc)
+      enc_args=(-c:v h264_nvenc -preset fast -cq "${DND_VIDEO_CRF:-18}" -b:v 0 -pix_fmt yuv420p)
+      enc_name="h264_nvenc (GPU)"
+      ;;
+    h264_vaapi)
+      enc_args=(-c:v h264_vaapi -qp "${DND_VIDEO_CRF:-18}" -pix_fmt yuv420p)
+      enc_name="h264_vaapi (GPU)"
+      ;;
+    *)
+      enc_args=(-c:v libx264 -preset ultrafast -crf "${DND_VIDEO_CRF:-18}" -pix_fmt yuv420p)
+      enc_name="libx264 ultrafast (CPU)"
+      ;;
+  esac
+
+  local is_gpu=0
+  [[ "$enc_choice" != "libx264" ]] && is_gpu=1
 
   local nproc
-  if [[ -n "$DND_RENDER_THREADS" ]]; then
-    nproc="$DND_RENDER_THREADS"
+  if [[ -n "${DND_RENDER_THREADS:-}" ]]; then nproc="$DND_RENDER_THREADS"
   else
-    nproc=$(nproc 2>/dev/null || echo 4)
+    if [[ $is_gpu -eq 1 ]]; then
+      nproc=$(nproc 2>/dev/null || echo 4)
+      [[ "$nproc" -gt 4 ]] && nproc=4
+    else
+      nproc=$(nproc 2>/dev/null || echo 4)
+      [[ "$nproc" -gt 8 ]] && nproc=8
+    fi
   fi
-  [[ $nproc -lt 1 ]] && nproc=1
-  [[ $nproc -gt 16 ]] && nproc=16
+  [[ "$nproc" -lt 1 ]] && nproc=1
 
-  DND_RENDER_PIDS=()
+  dnd-log "Stage 1/2: re-encoding $keep_count keep-segments with $enc_name, $nproc parallel..."
+
   local i=0
   local start_ts
   start_ts=$(date +%s)
@@ -73,22 +114,25 @@ function dnd-render-from-plan() {
 
   while IFS=$'\t' read -r start end; do
     i=$((i + 1))
-    while [[ ${#DND_RENDER_PIDS[@]} -ge $nproc ]]; do
-      wait "${DND_RENDER_PIDS[0]}" 2>/dev/null
-      DND_RENDER_PIDS=("${DND_RENDER_PIDS[@]:1}")
-    done
+    local seg_file="$piece_dir/piece_$(printf '%05d' "$i").mp4"
 
-    local seg_file="$seg_dir/seg_$(printf '%05d' "$i").mp4"
-    (
-      ffmpeg -y -nostdin -loglevel error \
-        -ss "$start" -to "$end" -i "$input" \
-        -c:v "$video_codec" -preset "$video_preset" "${quality_flag[@]}" \
-        -c:a aac -b:a "$DND_AUDIO_BITRATE" \
-        -pix_fmt yuv420p \
-        -movflags +faststart \
-        "$seg_file" 2>/dev/null
-    ) &
-    DND_RENDER_PIDS+=($!)
+    if [[ -s "$seg_file" ]]; then
+      : # already extracted on a previous run — skip
+    else
+      while [[ $(jobs -rp 2>/dev/null | wc -l) -ge "$nproc" ]]; do
+        wait -n 2>/dev/null || sleep 0.05
+      done
+
+      (
+        ffmpeg -y -nostdin -loglevel error \
+          -i "$local_input" \
+          -ss "$start" -to "$end" \
+          ${DND_PER_ENCODE_THREADS:+-threads "$DND_PER_ENCODE_THREADS"} \
+          "${enc_args[@]}" \
+          -c:a aac -b:a "${DND_AUDIO_BITRATE:-192k}" \
+          "$seg_file" 2>/dev/null
+      ) &
+    fi
 
     local now_ts pct
     now_ts=$(date +%s)
@@ -102,149 +146,71 @@ function dnd-render-from-plan() {
         (( remain < 0 )) && remain=0
         eta=$(printf '%02d:%02d' $((remain/60)) $((remain%60)))
       fi
-      printf '\r[dnd] segmenting… %3d%% (%d/%d, %d parallel, ETA %s) ' "$pct" "$i" "$keep_count" "${#DND_RENDER_PIDS[@]}" "$eta" >&2
+      printf '\r[dnd] re-encoding… %3d%% (%d/%d, %d parallel, ETA %s) ' "$pct" "$i" "$keep_count" "$(jobs -rp 2>/dev/null | wc -l)" "$eta" >&2
       last_pct=$pct
       last_report_ts=$now_ts
     fi
   done < <(jq -r '.timeline[] | select(.action=="keep") | "\(.start)\t\(.end)"' "$plan_json")
 
-  for pid in "${DND_RENDER_PIDS[@]}"; do
-    wait "$pid" 2>/dev/null
-  done
-  DND_RENDER_PIDS=()
-  printf '\r[dnd] segmenting… 100%% (%d/%d)\n' "$i" "$keep_count" >&2
+  wait
+  printf '\r[dnd] re-encoding… 100%% (%d/%d)\n' "$i" "$keep_count" >&2
 
   local extracted=0
-  for seg_file in "$seg_dir"/seg_*.mp4; do
-    [[ -f "$seg_file" ]] && extracted=$((extracted + 1))
+  for seg_file in "$piece_dir"/piece_*.mp4; do
+    [[ -f "$seg_file" ]] || continue
+    [[ -s "$seg_file" ]] || continue
+    extracted=$((extracted + 1))
   done
-  if [[ $extracted -eq 0 ]]; then
-    dnd-warn "No segments produced; copying original as fallback to $output"
-    cp -p "$input" "$output"
-    dnd-render-cleanup
+  if [[ "$extracted" -eq 0 ]]; then
+    dnd-err "No pieces produced. Aborting render."
     return 1
   fi
-  if [[ $extracted -lt $keep_count ]]; then
-    dnd-warn "Only $extracted of $keep_count segments produced (some failures)"
+  if [[ "$extracted" -lt "$keep_count" ]]; then
+    dnd-warn "Only $extracted of $keep_count pieces produced (some failures)"
   fi
 
-  local crossfade_s
-  crossfade_s=$(awk "BEGIN { printf \"%.3f\", $DND_CROSSFADE_MS / 1000 }")
-  local chunk_size="$DND_CHUNK_SIZE"
-  local total_chunks=$(( (extracted + chunk_size - 1) / chunk_size ))
-
-  dnd-log "Stitching $extracted segments into $total_chunks chunks of up to $chunk_size (${DND_CROSSFADE_MS}ms audio crossfades)..."
-
-  local chunk_idx=0
-  for ((c_start=1; c_start<=extracted; c_start+=chunk_size)); do
-    chunk_idx=$((chunk_idx + 1))
-    local c_end=$((c_start + chunk_size - 1))
-    [[ $c_end -gt $extracted ]] && c_end=$extracted
-
-    local chunk_file="$chunk_dir/chunk_$(printf '%05d' "$chunk_idx").mp4"
-    dnd-render-chunk "$seg_dir" "$c_start" "$c_end" "$chunk_file" "$crossfade_s" \
-                      "$video_codec" "$video_preset" "${quality_flag[@]}"
-
-    local pct=$(( chunk_idx * 100 / total_chunks ))
-    printf '\r[dnd] stitching… %3d%% (%d/%d chunks)' "$pct" "$chunk_idx" "$total_chunks" >&2
-  done
-  printf '\r[dnd] stitching… 100%% (%d/%d chunks)\n' "$chunk_idx" "$total_chunks" >&2
-
-  local concat_list="$chunk_dir/concat.txt"
+  local concat_list="$piece_dir/concat.txt"
   : > "$concat_list"
-  local n_chunks=0
-  for chunk_file in "$chunk_dir"/chunk_*.mp4; do
-    [[ -f "$chunk_file" ]] || continue
-    printf "file '%s'\n" "$(basename "$chunk_file")" >> "$concat_list"
-    n_chunks=$((n_chunks + 1))
+  for seg_file in "$piece_dir"/piece_*.mp4; do
+    [[ -f "$seg_file" ]] || continue
+    [[ -s "$seg_file" ]] || continue
+    printf "file '%s'\n" "$(basename "$seg_file")" >> "$concat_list"
   done
 
-  dnd-log "Concatenating $n_chunks chunks into final..."
-  if ! ffmpeg -y -nostdin -loglevel error \
+  dnd-log "Stage 2/2: concatenating $extracted pieces into final (concat copy)..."
+  local _log
+  _log=$(mktemp -t dnd-concat-log-XXXXXX.txt)
+  if ! ffmpeg -y -nostdin \
       -f concat -safe 0 -i "$concat_list" \
       -c copy -movflags +faststart \
-      "$output"; then
-    dnd-warn "Final concat failed; copying original as fallback to $output"
-    cp -p "$input" "$output"
-    dnd-render-cleanup
+      "$output" 2> "$_log"; then
+    local _tail
+    _tail=$(tail -30 "$_log" 2>/dev/null)
+    rm -f "$_log" "$concat_list"
+    dnd-err "Final concat failed. Aborting render."
+    dnd-err "ffmpeg stderr (last lines):"
+    while IFS= read -r line; do
+      dnd-err "  $line"
+    done <<< "$_tail"
+    rm -f "$ws_dir/final.mp4" 2>/dev/null
     return 1
   fi
+  rm -f "$_log" "$concat_list"
 
-  if [[ -z "${DND_KEEP_CHUNKS:-}" ]]; then
-    rm -f "$chunk_dir"/chunk_*.mp4 "$chunk_dir"/concat.txt
+  if [[ -z "${DND_KEEP_PIECES:-}" ]]; then
+    rm -rf "$piece_dir" 2>/dev/null
+  else
+    rm -f "$piece_dir/.source.mp4" 2>/dev/null
   fi
 
   local elapsed=$(( $(date +%s) - start_ts ))
   dnd-log "Render complete in $(printf '%02d:%02d' $((elapsed/60)) $((elapsed%60))): $output"
-  dnd-log "Segments kept at: $seg_dir"
-  dnd-render-cleanup
-}
-
-function dnd-render-chunk() {
-  local seg_dir="$1"
-  local start_idx="$2"
-  local end_idx="$3"
-  local output="$4"
-  local crossfade_s="$5"
-  local video_codec="$6"
-  local video_preset="$7"
-  shift 7
-  local quality_flag=("$@")
-
-  local n=$(( end_idx - start_idx + 1 ))
-
-  local fc_file
-  fc_file=$(mktemp -t dnd-fc-XXXXXX.txt)
-
-  local i
-  for ((i=0; i<n; i++)); do
-    printf "[%d:v]null[v%d];\n[%d:a]anull[a%d];\n" "$i" "$i" "$i" "$i" >> "$fc_file"
-  done
-
-  if [[ $n -gt 1 ]]; then
-    printf "[a0][a1]acrossfade=d=%s:c1=tri:c2=tri[c0];\n" "$crossfade_s" >> "$fc_file"
-    for ((i=2; i<n; i++)); do
-      printf "[c%d][a%d]acrossfade=d=%s:c1=tri:c2=tri[c%d];\n" "$((i-2))" "$i" "$crossfade_s" "$((i-1))" >> "$fc_file"
-    done
-    local final_audio_label="c$((n-2))"
-  else
-    local final_audio_label="a0"
+  if [[ -n "${DND_KEEP_PIECES:-}" ]]; then
+    dnd-log "Pieces kept at: $piece_dir"
   fi
-
-  local v_inputs=""
-  for ((i=0; i<n; i++)); do
-    v_inputs+="[v${i}]"
-  done
-  printf "%sconcat=n=%d:v=1:a=0[outv];\n" "$v_inputs" "$n" >> "$fc_file"
-  printf "[%s]anull[aout]\n" "$final_audio_label" >> "$fc_file"
-
-  local input_args=()
-  for ((i=start_idx; i<=end_idx; i++)); do
-    input_args+=(-i "$seg_dir/seg_$(printf '%05d' "$i").mp4")
-  done
-
-  ffmpeg -y -nostdin -loglevel error \
-    "${input_args[@]}" \
-    -filter_complex_script "$fc_file" \
-    -map "[outv]" -map "[aout]" \
-    -c:v "$video_codec" -preset "$video_preset" "${quality_flag[@]}" \
-    -c:a aac -b:a "$DND_AUDIO_BITRATE" \
-    -pix_fmt yuv420p \
-    -movflags +faststart \
-    "$output" 2>/dev/null
-
-  rm -f "$fc_file"
 }
 
 function dnd-render-cleanup() {
-  if [[ ${#DND_RENDER_PIDS[@]} -gt 0 ]]; then
-    for pid in "${DND_RENDER_PIDS[@]}"; do
-      kill "$pid" 2>/dev/null
-    done
-    DND_RENDER_PIDS=()
-  fi
-  DND_SEG_DIR=""
-  DND_CHUNK_DIR=""
-  DND_TAILER_PID=""
-  DND_PROG_FILE=""
+  jobs -rp 2>/dev/null | xargs -r kill 2>/dev/null
+  wait 2>/dev/null
 }
