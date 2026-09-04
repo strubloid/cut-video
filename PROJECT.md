@@ -5,8 +5,8 @@ non-speech gaps from long-form videos (interviews, talks, podcasts) using
 **WebRTC VAD** + **OpenAI Whisper**. Single command in, single cut video out —
 no interactive review, no manual decisions.
 
-The whole thing is plain bash + Python heredocs + ffmpeg/jq — no frameworks,
-no daemons, no compiled code.
+The whole thing is plain bash orchestrating real Python files + ffmpeg/jq —
+no frameworks, no daemons, no compiled code, no embedded heredocs.
 
 ```
 dnd-cut interview.mp4  →  dnd-cut  →  interview.dnd-cut/final.mp4
@@ -68,6 +68,10 @@ cut-video/
 ├── dnd-cut.sh               # entry point: sources components, defines dnd-cut()
 ├── install.sh               # creates /usr/local/bin/dnd-cut symlink, checks deps
 ├── PROJECT.md               # this file
+├── python/                  # standalone Python scripts (called from shell)
+│   ├── vad.py               # WebRTC VAD
+│   ├── timeline.py          # classify + build edit list
+│   └── refine.py            # snap to scene changes / audio zero crossings
 └── components/
     ├── config.sh            # tunables (exported env vars with defaults)
     ├── logger.sh            # dnd-log / dnd-warn / dnd-err + EXIT/INT traps
@@ -75,12 +79,17 @@ cut-video/
     ├── workspace.sh         # workspace dir, resume prompt
     ├── metadata.sh          # ffprobe wrapper
     ├── audio.sh             # ffmpeg → 16 kHz mono wav
-    ├── vad.sh               # WebRTC VAD (Python heredoc)
+    ├── vad.sh               # shells out to python/vad.py
     ├── whisper.sh           # whisper CLI wrapper
-    ├── timeline.sh          # classify + build edit list (Python heredoc)
-    ├── renderer.sh          # ffmpeg filter_complex render with fallback
+    ├── timeline.sh          # shells out to python/timeline.py
+    ├── refine.sh            # shells out to python/refine.py
+    ├── renderer.sh          # stream-copy segments + concat demuxer
     └── finalize.sh          # print summary
 ```
+
+The shell components are thin orchestrators — they call the Python files in
+`python/` via the venv interpreter (`$BASH_ALIASES_VENV_BIN/python`). No
+Python lives inside shell heredocs anymore.
 
 Each component file is independently sourceable and exports a small set of
 `dnd-*` functions. `dnd-cut.sh` just sources them in order and orchestrates.
@@ -167,7 +176,7 @@ validation errors get a clean prompt before the script exits.
 | 4 | Extract mono 16 kHz wav | `audio.sh` | `analysis/audio.wav` |
 | 5 | WebRTC VAD | `vad.sh` | `analysis/vad.json` |
 | 6 | Whisper word-timestamp transcription | `whisper.sh` | `analysis/audio.json` |
-| 7 | Classify timeline, build edit list | `timeline.sh` | `analysis/timeline.json` + `analysis/segments.json` |
+| 7 | Classify timeline, build edit list | `timeline.sh` → `python/timeline.py` | `analysis/timeline.json` + `analysis/segments.json` |
 | 8 | Render final cut | `renderer.sh` | `final.mp4` |
 | 9 | Print summary | `finalize.sh` | stdout |
 
@@ -272,15 +281,44 @@ Setting `DND_AUTO_RESUME=yes` skips the prompt and defaults to `r`.
 
 ## Render strategy
 
-`renderer.sh` does a **single-pass `ffmpeg` with a generated
-`filter_complex_script`**: one `trim` + `atrim` per keep-segment, all wired
-to a single `concat=n=N:v=1:a=1` node. This keeps A/V perfectly in sync and
-avoids per-clip re-encode drift.
+`renderer.sh` picks one of two paths based on `DND_RENDER_MODE`
+(default `auto`) and whether NVENC is available:
 
-If the filter-based render fails (codec, filter graph, anything), it falls
-back to copying the original as the output with a warning — the workspace
-is preserved and a `.filter_complex_$$.txt` is left next to the output
-for debugging.
+| Mode | Per-segment work | Speed | Cut accuracy |
+|------|------------------|-------|--------------|
+| `auto` / `stream-copy` (default) | `ffmpeg -i <input> -ss <start> -to <end> -c copy` | **very fast** (seconds) | frame-accurate via MP4 index |
+| `reencode` | `ffmpeg -i <input> -ss <start> -to <end> -c:v libx264 …` | slow on CPU, fast on NVENC | frame-accurate (re-encoded) |
+
+In **`auto` mode** the renderer probes for a working `h264_nvenc` (encoders
+list + a real test encode). If NVENC is available, it uses the re-encode
+path; otherwise it falls back to the default stream-copy path.
+
+The stream-copy path places `-ss` and `-to` *after* `-i` (output seek). For
+MP4 sources ffmpeg uses the container's packet index to seek to the exact
+packet at `<start>` and stops at the last packet with PTS `<= end`, so cuts
+land at the nearest packet boundary rather than the previous keyframe. This
+means adjacent segments do **not** overlap, with no re-encoding and no quality
+loss. (For sources without a seekable index — rare for `.mp4` — the seek may
+fall back to a keyframe snap; if you hit that, use `DND_RENDER_MODE=reencode`.)
+
+Either path then joins all `seg_*.mp4` with the concat demuxer:
+`ffmpeg -f concat -safe 0 -i <list.txt> -c copy -fflags +genpts -movflags +faststart <output>`.
+`-fflags +genpts` regenerates PTS across segments so audio and video stay in
+sync.
+
+If the concat fails for any reason, the renderer falls back to copying the
+original as the output with a warning — the workspace and segment files are
+preserved for inspection.
+
+Per-segment files (`seg_*.mp4` + `concat.txt`) are kept in `<ws>/.segments/`
+by default. Set `DND_KEEP_SEGMENTS=0` to delete them after a successful
+render.
+
+This is dramatically faster than the previous re-encode + filter_complex
+strategy and avoids the filter-graph length limit (concat demuxer has no
+such ceiling — a video with thousands of keep-segments works fine). The
+trade-off is that cuts are keyframe-snapped rather than frame-accurate,
+which is invisible for most interview/talk content.
 
 ---
 
@@ -328,11 +366,10 @@ Python venv (`$BASH_ALIASES_VENV_BIN`, default
   `silence`, and you'll cut the entire video down to almost nothing. Run
   the pipeline on a representative sample before trusting it on a whole
   catalog.
-- **Filter graph is built in a single ffmpeg call.** A video with thousands
-  of keep-segments will produce a very long `filter_complex_script` and may
-  exceed ffmpeg's filter-graph length limits. The renderer falls back to a
-  passthrough copy in that case, but the user-visible message is a warning,
-  not an error.
+- **Per-segment re-encode runs as many parallel ffmpeg jobs as cores.** On a
+  machine with thousands of keep-segments the per-segment ffmpeg startup
+  cost dominates. `DND_RENDER_THREADS` (default = `nproc`, capped at 16)
+  bounds the parallelism.
 - **No GPU memory detection.** `DND_WHISPER_DEVICE=cuda` will hard-fail on
   machines without a working CUDA stack. Set `DND_WHISPER_DEVICE=cpu` to
   fall back.
