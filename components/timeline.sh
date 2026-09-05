@@ -19,5 +19,7 @@ function dnd-build-timeline() {
     --review-threshold "$DND_SPEECH_REVIEW_THRESHOLD" \
     --pre-roll         "$DND_PRE_ROLL" \
     --post-roll        "$DND_POST_ROLL" \
+    --preserve-intro   "$DND_PRESERVE_INTRO_S" \
+    --preserve-end     "$DND_PRESERVE_END_S" \
     "$vad_json" "$whisper_json" "$segments_json" "$timeline_json"
 }

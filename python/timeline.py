@@ -23,6 +23,78 @@ def inside_keep(start: float, end: float, keep_ranges: list[tuple[float, float]]
     return False
 
 
+def apply_intro_preservation(classified: list[dict], preserve_intro_s: float, keep_threshold: float) -> list[dict]:
+    """Force every region overlapping [0, preserve_intro_s] to be kept as speech.
+
+    The presenter greeting at the top of a YouTube video usually has VAD
+    activity but no useful Whisper transcription (it gets flagged as
+    'vad_only' and removed by default). Treating the whole intro window as
+    'speech/keep' preserves that greeting without changing anything past the
+    window.
+    """
+    if preserve_intro_s <= 0:
+        return classified
+    new: list[dict] = []
+    for r in classified:
+        if r["start"] >= preserve_intro_s:
+            new.append(r)
+            continue
+        if r["end"] <= preserve_intro_s:
+            new.append(_force_keep(r, keep_threshold,
+                                   f"Preserved intro region (within first {preserve_intro_s}s)"))
+        else:
+            intro_part = dict(r)
+            intro_part["end"] = preserve_intro_s
+            intro_part["duration"] = round(preserve_intro_s - r["start"], 3)
+            new.append(_force_keep(intro_part, keep_threshold,
+                                   f"Preserved intro region (within first {preserve_intro_s}s)"))
+            after = dict(r)
+            after["start"] = preserve_intro_s
+            after["duration"] = round(r["end"] - preserve_intro_s, 3)
+            new.append(after)
+    return new
+
+
+def apply_end_preservation(classified: list[dict], duration: float, preserve_end_s: float, keep_threshold: float) -> list[dict]:
+    """Force every region overlapping [duration - preserve_end_s, duration] to be kept as speech.
+
+    Mirror of apply_intro_preservation for the outro: the presenter's goodbye,
+    call-to-action, and end screen all live in the last few minutes and would
+    otherwise be cut by the silence-detection rules.
+    """
+    if preserve_end_s <= 0:
+        return classified
+    end_start = max(0.0, duration - preserve_end_s)
+    reason = f"Preserved outro region (within last {preserve_end_s}s)"
+    new: list[dict] = []
+    for r in classified:
+        if r["end"] <= end_start:
+            new.append(r)
+            continue
+        if r["start"] >= end_start:
+            new.append(_force_keep(r, keep_threshold, reason))
+        else:
+            before = dict(r)
+            before["end"] = end_start
+            before["duration"] = round(end_start - r["start"], 3)
+            new.append(before)
+            end = dict(r)
+            end["start"] = end_start
+            end["duration"] = round(r["end"] - end_start, 3)
+            new.append(_force_keep(end, keep_threshold, reason))
+    return new
+
+
+def _force_keep(r: dict, keep_threshold: float, reason: str) -> dict:
+    kept = dict(r)
+    kept["classification"] = "speech"
+    kept["action"] = "keep"
+    kept["review_required"] = False
+    kept["speech_confidence"] = round(keep_threshold, 3)
+    kept["reason"] = reason
+    return kept
+
+
 def build(
     vad_path: str,
     whisper_path: str,
@@ -36,6 +108,8 @@ def build(
     review_threshold: float,
     pre_roll: float,
     post_roll: float,
+    preserve_intro_s: float,
+    preserve_end_s: float,
 ) -> int:
 
     with open(vad_path) as f:
@@ -132,6 +206,9 @@ def build(
         r for r in classified
         if not (r["classification"] == "speech" and r["duration"] < min_speech)
     ]
+
+    classified = apply_intro_preservation(classified, preserve_intro_s, keep_threshold)
+    classified = apply_end_preservation(classified, duration, preserve_end_s, keep_threshold)
 
     expanded = [expand_speech(r, pre_roll, post_roll, duration)
                 for r in classified if r["classification"] == "speech"]
@@ -247,6 +324,10 @@ def main() -> int:
     p.add_argument("--review-threshold",  type=float, required=True)
     p.add_argument("--pre-roll",          type=float, required=True)
     p.add_argument("--post-roll",         type=float, required=True)
+    p.add_argument("--preserve-intro",    type=float, default=0.0,
+                   help="Force the first N seconds to be kept (presenter greeting).")
+    p.add_argument("--preserve-end",      type=float, default=0.0,
+                   help="Force the last N seconds to be kept (outro / end screen).")
     args = p.parse_args()
 
     return build(
@@ -259,6 +340,8 @@ def main() -> int:
         review_threshold=args.review_threshold,
         pre_roll=args.pre_roll,
         post_roll=args.post_roll,
+        preserve_intro_s=args.preserve_intro,
+        preserve_end_s=args.preserve_end,
     )
 
 

@@ -142,6 +142,8 @@ Useful environment variables (all optional):
 | `DND_MIN_REMOVE_DURATION`  | `0.80` | silences shorter than this are NOT removed |
 | `DND_MIN_SPEECH_DURATION`  | `0.25` | speech regions shorter than this are dropped |
 | `DND_SPEECH_KEEP_THRESHOLD` | `0.40` | Whisper word probability required to mark `speech` |
+| `DND_PRESERVE_INTRO_S`     | `90`   | seconds at the start of the video to always keep (presenter greeting). Set to `0` to disable. |
+| `DND_PRESERVE_END_S`       | `300`  | seconds at the end of the video to always keep (outro / end screen). Set to `0` to disable. |
 | `DND_WHISPER_MODEL`     | `small` | whisper model size |
 | `DND_WHISPER_LANGUAGE`  | *(auto)* | language hint (e.g. `en`, `pt`, `es`); empty = Whisper auto-detects from the audio |
 | `DND_WHISPER_DEVICE`    | `cuda`  | `cuda` / `cpu` |
