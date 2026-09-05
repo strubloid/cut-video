@@ -58,6 +58,17 @@ function dnd-render-stream-copy() {
   local seg_dir="$4"
   local keep_count="$5"
 
+  local kf_file="$seg_dir/keyframes.txt"
+  if ! ffprobe -v error -select_streams v -skip_frame nokey \
+      -show_entries frame=pts_time -of csv=p=0 "$input" > "$kf_file" 2>/dev/null; then
+    dnd-warn "Failed to enumerate keyframes; falling back to re-encode"
+    dnd-render-reencode "$input" "$output" "$plan_json" "$seg_dir" "$keep_count" "cpu"
+    return $?
+  fi
+  local n_kf=0
+  [[ -s "$kf_file" ]] && n_kf=$(wc -l < "$kf_file")
+  dnd-log "Stream-copy (keyframe-snap forward): $n_kf keyframes; cuts snap forward up to ~1 GOP, no audio-only segments"
+
   local nproc
   if [[ -n "$DND_RENDER_THREADS" ]]; then
     nproc="$DND_RENDER_THREADS"
@@ -65,15 +76,16 @@ function dnd-render-stream-copy() {
     nproc=$(nproc 2>/dev/null || echo 4)
   fi
   [[ $nproc -lt 1 ]] && nproc=1
-  [[ $nproc -gt 16 ]] && nproc=16
+  [[ $nproc -gt 64 ]] && nproc=64
 
-  dnd-log "Stream-copy (output-seek) of $keep_count keep-segments into $seg_dir using up to $nproc parallel jobs..."
+  dnd-log "Extracting $keep_count keep-segments into $seg_dir (up to $nproc parallel)..."
 
   DND_RENDER_PIDS=()
   local i=0
   local start_ts=$(date +%s)
   local last_pct=-1
   local last_report_ts=0
+  local skipped=0
 
   while IFS=$'\t' read -r start end; do
     i=$((i + 1))
@@ -82,10 +94,23 @@ function dnd-render-stream-copy() {
       DND_RENDER_PIDS=("${DND_RENDER_PIDS[@]:1}")
     done
 
+    local actual_start="$start"
+    if [[ $n_kf -gt 0 ]]; then
+      local k
+      k=$(awk -v t="$start" '$1+0 >= t+0 {print $1; exit}' "$kf_file")
+      [[ -n "$k" ]] && actual_start="$k"
+    fi
+
+    if (( $(awk -v a="$actual_start" -v b="$end" 'BEGIN { print (b - a <= 0.05) ? 1 : 0 }') )); then
+      skipped=$((skipped + 1))
+      printf '\r[dnd] skipping seg %d (snap %s >= end %s)        ' "$i" "$actual_start" "$end" >&2
+      continue
+    fi
+
     local seg_file="$seg_dir/seg_$(printf '%05d' "$i").mp4"
     (
       ffmpeg -y -nostdin -loglevel error \
-        -i "$input" -ss "$start" -to "$end" \
+        -ss "$actual_start" -to "$end" -i "$input" \
         -c copy -avoid_negative_ts make_zero \
         "$seg_file" 2>/dev/null
     ) &
@@ -113,7 +138,7 @@ function dnd-render-stream-copy() {
     wait "$pid" 2>/dev/null
   done
   DND_RENDER_PIDS=()
-  printf '\r[dnd] extracting… 100%% (%d/%d)\n' "$i" "$keep_count" >&2
+  printf '\r[dnd] extracting… 100%% (%d/%d, %d skipped)\n' "$i" "$keep_count" "$skipped" >&2
 
   dnd-render-finalize "$input" "$output" "$seg_dir" "$start_ts" "$keep_count"
 }
@@ -145,7 +170,7 @@ function dnd-render-reencode() {
     nproc=$(nproc 2>/dev/null || echo 4)
   fi
   [[ $nproc -lt 1 ]] && nproc=1
-  [[ $nproc -gt 16 ]] && nproc=16
+  [[ $nproc -gt 64 ]] && nproc=64
 
   dnd-log "Re-encoding $keep_count keep-segments into $seg_dir using up to $nproc parallel jobs..."
 

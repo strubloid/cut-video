@@ -143,7 +143,7 @@ Useful environment variables (all optional):
 | `DND_MIN_SPEECH_DURATION`  | `0.25` | speech regions shorter than this are dropped |
 | `DND_SPEECH_KEEP_THRESHOLD` | `0.40` | Whisper word probability required to mark `speech` |
 | `DND_WHISPER_MODEL`     | `small` | whisper model size |
-| `DND_WHISPER_LANGUAGE`  | `en`    | language hint |
+| `DND_WHISPER_LANGUAGE`  | *(auto)* | language hint (e.g. `en`, `pt`, `es`); empty = Whisper auto-detects from the audio |
 | `DND_WHISPER_DEVICE`    | `cuda`  | `cuda` / `cpu` |
 | `BASH_ALIASES_VENV_BIN` | `~/.bash_aliases_scripts/.venv/bin` | path to the Python venv |
 

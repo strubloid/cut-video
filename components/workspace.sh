@@ -27,15 +27,19 @@ function dnd-resume-prompt() {
 
   if [[ -z "${choice:-}" ]]; then
     dnd-log "Existing workspace detected: $ws"
-    dnd-log "  [r] Resume (reuse analysis + timeline, just re-render)"
-    dnd-log "  [t] Rebuild timeline (keep audio/VAD/Whisper, rebuild timeline + render)"
-    dnd-log "  [a] Re-analyze (keep workspace, redo audio/VAD/Whisper + timeline + render)"
-    dnd-log "  [f] Fresh start (wipe workspace)"
+    printf '\n' >&2
+    dnd-log "  r  Resume           (reuse analysis + timeline, just re-render)"
+    dnd-log "  t  Rebuild timeline (keep audio/VAD/Whisper, rebuild timeline + render)"
+    dnd-log "  a  Re-analyze       (keep workspace, redo audio/VAD/Whisper + timeline + render)"
+    dnd-log "  f  Fresh start      (wipe workspace)"
+    printf '\n' >&2
     while true; do
-      read -r -n 1 -p "[dnd] Choose [r=Resume, t=Rebuild timeline, a=Re-analyze, f=Fresh start]: " choice
-      echo
-      case "$choice" in
-        r|t|a|f) break ;;
+      local ans
+      printf '[dnd] Enter choice [r/t/a/f]: ' >&2
+      read -r -n 1 ans
+      printf '\n' >&2
+      case "$ans" in
+        r|t|a|f) choice="$ans"; break ;;
         *) dnd-warn "Please press r, t, a or f." ;;
       esac
     done
