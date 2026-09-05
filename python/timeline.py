@@ -110,6 +110,7 @@ def build(
     post_roll: float,
     preserve_intro_s: float,
     preserve_end_s: float,
+    min_keep_silence_s: float,
 ) -> int:
 
     with open(vad_path) as f:
@@ -227,7 +228,7 @@ def build(
     for m in merged:
         if m["start"] > cursor:
             gap_d = m["start"] - cursor
-            if gap_d >= min_remove:
+            if gap_d >= min_remove and gap_d > min_keep_silence_s:
                 timeline.append({
                     "id": seg_id,
                     "start":  round(cursor, 3),
@@ -256,7 +257,7 @@ def build(
 
     if cursor < duration - 0.01:
         gap_d = duration - cursor
-        if gap_d >= min_remove:
+        if gap_d >= min_remove and gap_d > min_keep_silence_s:
             timeline.append({
                 "id": seg_id,
                 "start":  round(cursor, 3),
@@ -320,6 +321,8 @@ def main() -> int:
     p.add_argument("--duration",          type=float, required=True)
     p.add_argument("--min-speech",        type=float, required=True)
     p.add_argument("--min-remove",        type=float, required=True)
+    p.add_argument("--min-keep-silence",  type=float, default=0.30,
+                   help="Silences shorter than this are always kept (breath floor).")
     p.add_argument("--keep-threshold",    type=float, required=True)
     p.add_argument("--review-threshold",  type=float, required=True)
     p.add_argument("--pre-roll",          type=float, required=True)
@@ -336,6 +339,7 @@ def main() -> int:
         duration=args.duration,
         min_speech=args.min_speech,
         min_remove=args.min_remove,
+        min_keep_silence_s=args.min_keep_silence,
         keep_threshold=args.keep_threshold,
         review_threshold=args.review_threshold,
         pre_roll=args.pre_roll,

@@ -15,6 +15,7 @@ function dnd-build-timeline() {
     --duration         "$duration" \
     --min-speech       "$DND_MIN_SPEECH_DURATION" \
     --min-remove       "$DND_MIN_REMOVE_DURATION" \
+    --min-keep-silence "$DND_MIN_KEEP_SILENCE_S" \
     --keep-threshold   "$DND_SPEECH_KEEP_THRESHOLD" \
     --review-threshold "$DND_SPEECH_REVIEW_THRESHOLD" \
     --pre-roll         "$DND_PRE_ROLL" \

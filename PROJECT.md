@@ -139,7 +139,8 @@ Useful environment variables (all optional):
 | `DND_NO_PAUSE`    | `0`    | if `1`, skip the "Press enter to exit…" prompt |
 | `DND_PRE_ROLL`    | `0.30` | seconds of padding kept before each speech region |
 | `DND_POST_ROLL`   | `0.40` | seconds of padding kept after each speech region |
-| `DND_MIN_REMOVE_DURATION`  | `0.80` | silences shorter than this are NOT removed |
+| `DND_MIN_REMOVE_DURATION`  | `1.00` | silences shorter than this are NOT removed (and silences above this that are bigger than `MIN_KEEP_SILENCE_S`) |
+| `DND_MIN_KEEP_SILENCE_S`   | `0.30` | hard floor: silences shorter than this are ALWAYS kept |
 | `DND_MIN_SPEECH_DURATION`  | `0.25` | speech regions shorter than this are dropped |
 | `DND_SPEECH_KEEP_THRESHOLD` | `0.40` | Whisper word probability required to mark `speech` |
 | `DND_PRESERVE_INTRO_S`     | `90`   | seconds at the start of the video to always keep (presenter greeting). Set to `0` to disable. |
@@ -195,6 +196,12 @@ time, e.g. `DND_PRE_ROLL=0.5 dnd-cut talk.mp4`. The defaults are tuned for
 - **`MIN_REMOVE_DURATION`** is the silence floor — cutting a 200 ms pause
   is rarely worth the splice artifact, so it stays. Set to `0` to cut
   everything.
+- **`MIN_KEEP_SILENCE_S`** is a hard floor below which a silence is *always*
+  preserved (breaths, think pauses). Defaults to `0.30`. Together with
+  `MIN_REMOVE_DURATION`, this forms a "soft / hard silence" tier:
+  `< MIN_KEEP_SILENCE_S` → always keep ·
+  `MIN_KEEP_SILENCE_S … MIN_REMOVE_DURATION` → keep ·
+  `≥ MIN_REMOVE_DURATION` → cut.
 - **`MIN_SPEECH_DURATION`** drops speech regions shorter than this
   (Whisper occasionally hallucinates a one-word blip).
 - **`SPEECH_KEEP_THRESHOLD`** filters out low-confidence Whisper words
@@ -392,6 +399,44 @@ Python venv (`$BASH_ALIASES_VENV_BIN`, default
   this?" prompt.
 
 ---
+
+## Future improvements (not yet implemented)
+
+These are the real "editor intelligence" features the pipeline is missing
+today. They're listed honestly so it's clear what's possible vs what's rule-based:
+
+- **Speaker diarization** — Who is speaking when. The pipeline currently has
+  no concept of speakers, so it can't cut *at* speaker changes (often the
+  best cut point in a multi-host conversation), and it can't tell whether
+  the content of two adjacent `vad_only` regions belongs to the same
+  voice. The Python ecosystem has solid options (`pyannote.audio`,
+  `whisperX`) that bolt on cleanly once we wire them up. Cost: adds a
+  heavy GPU/CPU step and a third JSON to the analysis pipeline.
+- **Sentence-boundary cut preference** — Right now cuts land in silence
+  whenever the silence is long enough. A stronger heuristic would prefer
+  cuts that *also* align with sentence boundaries (after `.`, `?`, `!`),
+  since those are where a speaker would naturally pause anyway. Whisper
+  word tokens already carry punctuation, so this is a few lines in
+  `timeline.py` — it's a quality-of-life improvement, not a real
+  intelligence jump.
+- **Soft audio crossfades at cut points** — The current renderer
+  concatenates segments with hard cuts. A 10–50 ms audio crossfade on
+  each side of every cut makes the transition imperceptible. The catch:
+  crossfades require re-encoding, which on CPU is the very thing we made
+  the stream-copy path to avoid. Would live behind a new
+  `DND_RENDER_MODE=reencode-softcut` value (or similar) and would
+  require NVIDIA or a lot of patience.
+- **Cross-talk / overlap detection** — When two people talk over each
+  other, Whisper transcribes the louder one and tags the region as
+  `vad_only`, so the softer voice gets cut. There's no clean fix without
+  speaker diarization first (you need to know it's a *second voice*,
+  not background noise). Falls out for free once the first item above is
+  in.
+
+None of these are blocked; they're each maybe 100–300 lines of work plus
+testing. Flagging them because the user feedback that prompted this
+section ("recognize voices", "match words", "multiple people") is
+fundamentally about these features, not about tuning more dials.
 
 ## Exit codes
 
