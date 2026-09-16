@@ -67,7 +67,18 @@ function dnd-render-stream-copy() {
   fi
   local n_kf=0
   [[ -s "$kf_file" ]] && n_kf=$(wc -l < "$kf_file")
-  dnd-log "Stream-copy (keyframe-snap forward): $n_kf keyframes; cuts snap forward up to ~1 GOP, no audio-only segments"
+  dnd-log "Stream-copy (backward keyframe snap + overlap clip + audio frame cap)"
+
+  # Probe audio: get sample rate so we can compute exact audio-frame
+  # counts per segment. ffmpeg's `-frames:a N` is the only reliable
+  # way to drop the pre-roll audio frame that stream-copy otherwise
+  # includes from before the requested `-ss` time.
+  local audio_sr=48000
+  local audio_framesize=1024
+  local probe_out
+  probe_out=$(ffprobe -v error -select_streams a:0 \
+              -show_entries stream=sample_rate -of csv=p=0 "$input" 2>/dev/null | head -1)
+  [[ "$probe_out" =~ ^[0-9]+$ ]] && audio_sr="$probe_out"
 
   local nproc
   if [[ -n "$DND_RENDER_THREADS" ]]; then
@@ -78,7 +89,27 @@ function dnd-render-stream-copy() {
   [[ $nproc -lt 1 ]] && nproc=1
   [[ $nproc -gt 64 ]] && nproc=64
 
-  dnd-log "Extracting $keep_count keep-segments into $seg_dir (up to $nproc parallel)..."
+  # ---------------------------------------------------------------------
+  # Pass 1: compute (actual_start, actual_end) for every keep range,
+  # guaranteeing adjacent segments never overlap in source range.
+  # Also compute exact audio frame counts.
+  # ---------------------------------------------------------------------
+  local ranges_file="$seg_dir/ranges.tsv"
+  local backward_snap=1
+  [[ "${DND_RENDER_BACKWARD_KEYFRAME_SNAP:-1}" == "0" ]] && backward_snap=0
+  local epsilon="${DND_RENDER_BOUNDARY_EPSILON_S:-0.04}"
+
+  "${BASH_ALIASES_VENV_BIN}/python" \
+    "$CUT_VIDEO_ROOT/python/render_ranges.py" \
+    --plan         "$plan_json" \
+    --keyframes    "$kf_file" \
+    --backward-snap "$backward_snap" \
+    --epsilon       "$epsilon" \
+    --out           "$ranges_file"
+
+  local total
+  total=$(wc -l < "$ranges_file")
+  dnd-log "Computed $total non-overlapping segment ranges; extracting (up to $nproc parallel)..."
 
   DND_RENDER_PIDS=()
   local i=0
@@ -87,60 +118,77 @@ function dnd-render-stream-copy() {
   local last_report_ts=0
   local skipped=0
 
-  while IFS=$'\t' read -r start end; do
+  while IFS=$'\t' read -r actual_start actual_end; do
     i=$((i + 1))
     while [[ ${#DND_RENDER_PIDS[@]} -ge $nproc ]]; do
       wait "${DND_RENDER_PIDS[0]}" 2>/dev/null
       DND_RENDER_PIDS=("${DND_RENDER_PIDS[@]:1}")
     done
 
-    local actual_start="$start"
-    if [[ $n_kf -gt 0 ]]; then
-      local k
-      k=$(awk -v t="$start" '$1+0 >= t+0 {print $1; exit}' "$kf_file")
-      [[ -n "$k" ]] && actual_start="$k"
-    fi
-
-    if (( $(awk -v a="$actual_start" -v b="$end" 'BEGIN { print (b - a <= 0.05) ? 1 : 0 }') )); then
+    if (( $(awk -v a="$actual_start" -v b="$actual_end" 'BEGIN { print (b - a <= 0.05) ? 1 : 0 }') )); then
       skipped=$((skipped + 1))
-      printf '\r[dnd] skipping seg %d (snap %s >= end %s)        ' "$i" "$actual_start" "$end" >&2
+      printf '\r[dnd] skipping seg %d (range [%s, %s] too short)  ' "$i" "$actual_start" "$actual_end" >&2
       continue
     fi
 
+    # Compute exact audio frame count for this segment. ffmpeg's
+    # stream-copy mode includes the AAC frame that straddles the
+    # requested `-ss` time (it sits one frame before the seek
+    # point). `-frames:a N` is the only reliable way to drop that
+    # pre-roll frame and avoid the "bummmm" artifact when the
+    # previous segment's tail audio overlaps with it.
+    #
+    # `-frames:a` is honoured by ffmpeg's decoder/encode pipeline
+    # but NOT by stream copy on the audio track. So we have to
+    # re-encode audio (cheap: ~10× realtime for AAC). Video stays
+    # stream copy.
+    local n_frames
+    n_frames=$(awk -v s="$actual_start" -v e="$actual_end" \
+                     -v sr="$audio_sr" -v fs="$audio_framesize" \
+                     'BEGIN { printf("%d\n", int((e - s) * sr / fs + 1.5)) }')
+
     local seg_file="$seg_dir/seg_$(printf '%05d' "$i").mp4"
     (
+      # Video stream-copy; audio re-encode with frame-count cap.
+      # Do NOT pass `-avoid_negative_ts make_zero`: with MP4 +
+      # B-frames + stream-copy, that flag causes ffmpeg to include
+      # ~50 extra audio packets past the requested `-to` boundary,
+      # which then plays back as duplicated audio. The concat
+      # demuxer's `-fflags +genpts` handles per-segment PTS
+      # correctly without it.
       ffmpeg -y -nostdin -loglevel error \
-        -ss "$actual_start" -to "$end" -i "$input" \
-        -c copy -avoid_negative_ts make_zero \
+        -ss "$actual_start" -to "$actual_end" -i "$input" \
+        -c:v copy -c:a aac -b:a "$DND_AUDIO_BITRATE" \
+        -frames:a "$n_frames" \
         "$seg_file" 2>/dev/null
     ) &
     DND_RENDER_PIDS+=($!)
 
     local now_ts pct
     now_ts=$(date +%s)
-    pct=$(( i * 100 / keep_count ))
+    pct=$(( i * 100 / total ))
     if [[ $((pct / 5)) -ne $((last_pct / 5)) ]] || (( now_ts - last_report_ts >= 3 )); then
       local elapsed=$(( now_ts - start_ts ))
       local eta="--:--"
       if [[ $i -gt 0 && $elapsed -gt 0 ]]; then
-        local total_est=$(( elapsed * keep_count / i ))
+        local total_est=$(( elapsed * total / i ))
         local remain=$(( total_est - elapsed ))
         (( remain < 0 )) && remain=0
         eta=$(printf '%02d:%02d' $((remain/60)) $((remain%60)))
       fi
-      printf '\r[dnd] extracting… %3d%% (%d/%d, %d parallel, ETA %s) ' "$pct" "$i" "$keep_count" "${#DND_RENDER_PIDS[@]}" "$eta" >&2
+      printf '\r[dnd] extracting… %3d%% (%d/%d, %d parallel, ETA %s) ' "$pct" "$i" "$total" "${#DND_RENDER_PIDS[@]}" "$eta" >&2
       last_pct=$pct
       last_report_ts=$now_ts
     fi
-  done < <(jq -r '.timeline[] | select(.action=="keep") | "\(.start)\t\(.end)"' "$plan_json")
+  done < "$ranges_file"
 
   for pid in "${DND_RENDER_PIDS[@]}"; do
     wait "$pid" 2>/dev/null
   done
   DND_RENDER_PIDS=()
-  printf '\r[dnd] extracting… 100%% (%d/%d, %d skipped)\n' "$i" "$keep_count" "$skipped" >&2
+  printf '\r[dnd] extracting… 100%% (%d/%d, %d skipped)\n' "$i" "$total" "$skipped" >&2
 
-  dnd-render-finalize "$input" "$output" "$seg_dir" "$start_ts" "$keep_count"
+  dnd-render-finalize "$input" "$output" "$seg_dir" "$start_ts" "$total"
 }
 
 function dnd-render-reencode() {
@@ -163,6 +211,14 @@ function dnd-render-reencode() {
     dnd-log "CPU: libx264 -preset veryfast -crf $DND_VIDEO_CRF"
   fi
 
+  # Probe audio for frame count calculations.
+  local audio_sr=48000
+  local audio_framesize=1024
+  local probe_out
+  probe_out=$(ffprobe -v error -select_streams a:0 \
+              -show_entries stream=sample_rate -of csv=p=0 "$input" 2>/dev/null | head -1)
+  [[ "$probe_out" =~ ^[0-9]+$ ]] && audio_sr="$probe_out"
+
   local nproc
   if [[ -n "$DND_RENDER_THREADS" ]]; then
     nproc="$DND_RENDER_THREADS"
@@ -174,25 +230,53 @@ function dnd-render-reencode() {
 
   dnd-log "Re-encoding $keep_count keep-segments into $seg_dir using up to $nproc parallel jobs..."
 
+  # Same 2-pass strategy for the re-encode path: compute non-overlapping
+  # ranges first, then extract in parallel.
+  local kf_file="$seg_dir/keyframes.txt"
+  if ffprobe -v error -select_streams v -skip_frame nokey \
+      -show_entries frame=pts_time -of csv=p=0 "$input" > "$kf_file" 2>/dev/null; then
+    : # ok
+  else
+    : > "$kf_file"
+  fi
+  local ranges_file="$seg_dir/ranges.tsv"
+  local backward_snap=1
+  [[ "${DND_RENDER_BACKWARD_KEYFRAME_SNAP:-1}" == "0" ]] && backward_snap=0
+  local epsilon="${DND_RENDER_BOUNDARY_EPSILON_S:-0.04}"
+
+  "${BASH_ALIASES_VENV_BIN}/python" \
+    "$CUT_VIDEO_ROOT/python/render_ranges.py" \
+    --plan         "$plan_json" \
+    --keyframes    "$kf_file" \
+    --backward-snap "$backward_snap" \
+    --epsilon       "$epsilon" \
+    --out           "$ranges_file"
+
   DND_RENDER_PIDS=()
   local i=0
   local start_ts=$(date +%s)
   local last_pct=-1
   local last_report_ts=0
 
-  while IFS=$'\t' read -r start end; do
+  while IFS=$'\t' read -r actual_start actual_end; do
     i=$((i + 1))
     while [[ ${#DND_RENDER_PIDS[@]} -ge $nproc ]]; do
       wait "${DND_RENDER_PIDS[0]}" 2>/dev/null
       DND_RENDER_PIDS=("${DND_RENDER_PIDS[@]:1}")
     done
 
+    local n_frames
+    n_frames=$(awk -v s="$actual_start" -v e="$actual_end" \
+                     -v sr="$audio_sr" -v fs="$audio_framesize" \
+                     'BEGIN { printf("%d\n", int((e - s) * sr / fs + 1.5)) }')
+
     local seg_file="$seg_dir/seg_$(printf '%05d' "$i").mp4"
     (
+      # Stream-copy video; re-encode audio with frame-count cap.
       ffmpeg -y -nostdin -loglevel error \
-        -i "$input" -ss "$start" -to "$end" \
+        -i "$input" -ss "$actual_start" -to "$actual_end" \
         -c:v "$video_codec" -preset "$video_preset" "${quality_flag[@]}" \
-        -c:a aac -b:a "$DND_AUDIO_BITRATE" \
+        -c:a aac -b:a "$DND_AUDIO_BITRATE" -frames:a "$n_frames" \
         -pix_fmt yuv420p \
         -movflags +faststart \
         "$seg_file" 2>/dev/null
@@ -215,7 +299,7 @@ function dnd-render-reencode() {
       last_pct=$pct
       last_report_ts=$now_ts
     fi
-  done < <(jq -r '.timeline[] | select(.action=="keep") | "\(.start)\t\(.end)"' "$plan_json")
+  done < "$ranges_file"
 
   for pid in "${DND_RENDER_PIDS[@]}"; do
     wait "$pid" 2>/dev/null

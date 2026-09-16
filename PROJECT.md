@@ -1,16 +1,50 @@
 # dnd-cut
 
-A "drag-and-drop" style bash pipeline that automatically removes silence and
-non-speech gaps from long-form videos (interviews, talks, podcasts) using
-**WebRTC VAD** + **OpenAI Whisper**. Single command in, single cut video out —
-no interactive review, no manual decisions.
+A "drag-and-drop" style bash pipeline that **safely** removes obviously
+empty / background-only time from long-form videos (D&D session
+recordings, interviews, talks, podcasts). It is a **pre-editing cleanup
+tool**, not a finished editor — its job is to give the human editor a
+shorter, safer starting point.
+
+```
+dnd-cut session.mp4  →  dnd-cut  →  session.dnd-cut/final.mp4
+```
 
 The whole thing is plain bash orchestrating real Python files + ffmpeg/jq —
 no frameworks, no daemons, no compiled code, no embedded heredocs.
 
-```
-dnd-cut interview.mp4  →  dnd-cut  →  interview.dnd-cut/final.mp4
-```
+---
+
+## Design principles (read this first)
+
+The pipeline is built around one non-negotiable rule:
+
+> **Never sacrifice spoken content just to make the video shorter.**
+
+If the system is uncertain whether a section contains speech, **KEEP IT**.
+
+That rule cascades into five priorities the pipeline enforces in order:
+
+1. Preserve speech.
+2. Preserve complete words (no clipping consonants).
+3. Preserve conversations.
+4. Preserve natural conversational pauses.
+5. Remove genuinely unnecessary empty / background-only time.
+
+A 10% shorter video with all speech intact is much better than a 30%
+shorter video that requires recovering missing pieces from the original
+recording.
+
+The previous version of this tool optimised in the opposite order. It
+was too aggressive in three ways that compounded into word-clipping:
+
+| Old behaviour                                              | Fix                                            |
+|------------------------------------------------------------|------------------------------------------------|
+| VAD-only regions (audio without Whisper text) auto-removed | VAD-only regions are now *kept* as potential speech |
+| Any silence ≥ 2 s removed                                  | Default silence floor is 4 s; short pauses preserved |
+| Whisper word probability `< 0.40` reclassified as silence  | Every Whisper word contributes to a speech interval regardless of confidence |
+| `refine.py` snapped cuts INTO the lowest-RMS window inside `±0.2 s` (often *inside* a word) | `refine.py` only ever **expands** keep regions outward into silence; never shrinks toward speech |
+| Stream-copy renderer snapped each segment start to the **next** keyframe (consuming up to one full GOP of pre-roll) | Default is to snap to the **previous** keyframe (can only add audio, never remove) |
 
 ---
 
@@ -27,6 +61,7 @@ dnd-cut interview.mp4  →  dnd-cut  →  interview.dnd-cut/final.mp4
 - [Render strategy](#render-strategy)
 - [Signals & terminal handling](#signals--terminal-handling)
 - [Dependencies](#dependencies)
+- [Testing](#testing)
 - [Limitations & known caveats](#limitations--known-caveats)
 
 ---
@@ -44,18 +79,25 @@ Under the hood:
    speech-like region.
 3. Runs **Whisper** with word-level timestamps to get a transcript and
    per-word probabilities.
-4. Classifies the timeline into three categories:
-   - **`speech`** — Whisper transcribed real words here → `keep`
-   - **`vad_only`** — VAD heard voice but Whisper heard nothing → `remove`
-     (this is the change: `vad_only` segments are now treated as silence and
-     cut automatically, no questions asked)
-   - **`silence`** — no speech-like audio at all
-     - short silences (< `DND_MIN_REMOVE_DURATION`) are kept (cheaper than
-       a splice)
-     - long silences are removed automatically
-5. Builds a clean edit list: keep every speech region (padded by
-   `DND_PRE_ROLL` / `DND_POST_ROLL`), splice them together, and render
-   `final.mp4` in a single ffmpeg pass.
+4. Runs **ffmpeg `silencedetect`** as a complementary quiet-zone signal.
+5. Classifies the timeline conservatively:
+   - **`speech`** — Whisper words OR VAD activity → **keep**.
+     Every Whisper word, regardless of confidence, contributes to a
+     speech interval. Low-probability words are *not* reclassified as
+     silence (that was the bug that ate quiet speakers).
+   - **`gap`** — silence between speech intervals.
+     Removed only if (a) it's at least `DND_MIN_REMOVE_DURATION` long,
+     AND (b) it contains no Whisper word OR VAD activity. Anything
+     else is kept, even if "long".
+6. Pads every kept speech region with `DND_SPEECH_START_PADDING` /
+   `DND_SPEECH_END_PADDING` and adds a defensive
+   `DND_WORD_BOUNDARY_SAFETY_S` around any Whisper word so the
+   renderer can't chop a consonant.
+7. Refines cut points with an **expand-only** policy: cuts can only
+   move outward into silence, never inward toward speech.
+8. Renders `final.mp4` with the stream-copy renderer; cuts snap to
+   the **previous** keyframe so they can only add audio, never remove
+   it.
 
 Everything is idempotent — re-running picks up where it left off.
 
@@ -70,21 +112,27 @@ cut-video/
 ├── PROJECT.md               # this file
 ├── python/                  # standalone Python scripts (called from shell)
 │   ├── vad.py               # WebRTC VAD
-│   ├── timeline.py          # classify + build edit list
-│   └── refine.py            # snap to scene changes / audio zero crossings
-└── components/
-    ├── config.sh            # tunables (exported env vars with defaults)
-    ├── logger.sh            # dnd-log / dnd-warn / dnd-err + EXIT/INT traps
-    ├── dependencies.sh      # dnd-dependencies-check
-    ├── workspace.sh         # workspace dir, resume prompt
-    ├── metadata.sh          # ffprobe wrapper
-    ├── audio.sh             # ffmpeg → 16 kHz mono wav
-    ├── vad.sh               # shells out to python/vad.py
-    ├── whisper.sh           # whisper CLI wrapper
-    ├── timeline.sh          # shells out to python/timeline.py
-    ├── refine.sh            # shells out to python/refine.py
-    ├── renderer.sh          # stream-copy segments + concat demuxer
-    └── finalize.sh          # print summary
+│   ├── silence_detect.py    # ffmpeg silencedetect -> JSON regions
+│   ├── timeline.py          # classify + build edit list (conservative)
+│   └── refine.py            # snap cuts OUTWARD into silence (expand-only)
+├── components/
+│   ├── config.sh            # tunables (exported env vars with defaults)
+│   ├── logger.sh            # dnd-log / dnd-warn / dnd-err + EXIT/INT traps
+│   ├── dependencies.sh      # dnd-dependencies-check
+│   ├── workspace.sh         # workspace dir, resume prompt
+│   ├── metadata.sh          # ffprobe wrapper
+│   ├── audio.sh             # ffmpeg → 16 kHz mono wav
+│   ├── silence.sh           # ffmpeg silencedetect wrapper
+│   ├── vad.sh               # shells out to python/vad.py
+│   ├── whisper.sh           # whisper CLI wrapper
+│   ├── timeline.sh          # shells out to python/timeline.py
+│   ├── refine.sh            # shells out to python/refine.py
+│   ├── renderer.sh          # stream-copy segments + concat demuxer
+│   └── finalize.sh          # print summary
+└── tests/                   # Python unit tests (no pytest dep)
+    ├── run_tests.py         # `python3 tests/run_tests.py`
+    ├── fixtures.py          # synthetic VAD/whisper/silence generators
+    └── test_timeline.py     # 12 tests covering the 7 required scenarios
 ```
 
 The shell components are thin orchestrators — they call the Python files in
@@ -93,11 +141,6 @@ Python lives inside shell heredocs anymore.
 
 Each component file is independently sourceable and exports a small set of
 `dnd-*` functions. `dnd-cut.sh` just sources them in order and orchestrates.
-
-> **No review components.** Earlier versions of this tool had
-> `components/leftovers.sh`, `decisions.sh`, and `review.sh` for an
-> interactive per-segment review. They were removed when the review step
-> was dropped — the pipeline is now fully automatic.
 
 ---
 
@@ -137,39 +180,42 @@ Useful environment variables (all optional):
 |---|---|---|
 | `DND_AUTO_RESUME` | `ask` | `ask` prompts on resume; `yes` silently resumes |
 | `DND_NO_PAUSE`    | `0`    | if `1`, skip the "Press enter to exit…" prompt |
-| `DND_PRE_ROLL`    | `0.30` | seconds of padding kept before each speech region |
-| `DND_POST_ROLL`   | `0.40` | seconds of padding kept after each speech region |
-| `DND_MIN_REMOVE_DURATION`  | `1.00` | silences shorter than this are NOT removed (and silences above this that are bigger than `MIN_KEEP_SILENCE_S`) |
-| `DND_MIN_KEEP_SILENCE_S`   | `0.30` | hard floor: silences shorter than this are ALWAYS kept |
+| `DND_SPEECH_START_PADDING` | `0.60` | seconds of audio kept BEFORE each speech region |
+| `DND_SPEECH_END_PADDING`   | `0.70` | seconds of audio kept AFTER each speech region |
+| `DND_PRE_ROLL`    | `0.60` | backwards-compat alias for `DND_SPEECH_START_PADDING` |
+| `DND_POST_ROLL`   | `0.70` | backwards-compat alias for `DND_SPEECH_END_PADDING` |
+| `DND_WORD_BOUNDARY_SAFETY_S` | `0.30` | cuts are never placed within this many seconds of any Whisper word |
+| `DND_MIN_REMOVE_DURATION`  | `4.00` | silence shorter than this is NEVER removed |
+| `DND_MIN_KEEP_SILENCE_S`   | `1.00` | hard floor specifically against aggressive cutting of natural conversational pauses |
+| `DND_MERGE_GAP_S`          | `1.50` | speech intervals closer than this are merged into one conversational segment |
 | `DND_MIN_SPEECH_DURATION`  | `0.25` | speech regions shorter than this are dropped |
-| `DND_SPEECH_KEEP_THRESHOLD` | `0.40` | Whisper word probability required to mark `speech` |
-| `DND_PRESERVE_INTRO_S`     | `90`   | seconds at the start of the video to always keep (presenter greeting). Set to `0` to disable. |
-| `DND_PRESERVE_END_S`       | `300`  | seconds at the end of the video to always keep (outro / end screen). Set to `0` to disable. |
+| `DND_SPEECH_KEEP_THRESHOLD` | `0.40` | Whisper word probability used only for *labelling*; not used for filtering |
+| `DND_SILENCEDETECT_NOISE_DB`   | `-35` | dBFS threshold for ffmpeg `silencedetect` |
+| `DND_SILENCEDETECT_MIN_DURATION` | `0.5` | minimum silence duration for ffmpeg `silencedetect` |
+| `DND_PRESERVE_INTRO_S`     | `90`   | seconds at the start of the video to always keep. Set to `0` to disable. |
+| `DND_PRESERVE_END_S`       | `300`  | seconds at the end of the video to always keep. Set to `0` to disable. |
 | `DND_WHISPER_MODEL`     | `small` | whisper model size |
 | `DND_WHISPER_LANGUAGE`  | *(auto)* | language hint (e.g. `en`, `pt`, `es`); empty = Whisper auto-detects from the audio |
 | `DND_WHISPER_DEVICE`    | `cuda`  | `cuda` / `cpu` |
+| `DND_REFINE_WORD_SAFETY_S`    | `0.30` | refine-step word-boundary guard |
+| `DND_REFINE_EXTEND_WINDOW_S`  | `0.25` | how far outward (seconds) the refiner can extend cuts into silence |
+| `DND_RENDER_BACKWARD_KEYFRAME_SNAP` | `1` | `1` = snap to previous keyframe (safe); `0` = legacy forward snap |
 | `BASH_ALIASES_VENV_BIN` | `~/.bash_aliases_scripts/.venv/bin` | path to the Python venv |
 
-### Cut every silence, no matter how short
+### Tune for more or less compression
 
-By default `DND_MIN_REMOVE_DURATION=0.80` means silences under 0.8 s are
-preserved (a 200 ms breath isn't worth a splice). To literally cut every
-gap:
-
-```bash
-DND_MIN_REMOVE_DURATION=0 dnd-cut talk.mp4
-```
-
-`DND_MIN_SPEECH_DURATION=0` will likewise stop dropping tiny speech
-regions.
+- **Less aggressive (preserve more):** raise `DND_MIN_REMOVE_DURATION`
+  (e.g. `6.0`), raise `DND_SPEECH_START_PADDING` / `DND_SPEECH_END_PADDING`
+  (e.g. `1.0`).
+- **More aggressive (cut more):** lower `DND_MIN_REMOVE_DURATION`
+  (e.g. `2.5`), lower the merge gap (e.g. `0.8`). Be aware this
+  increases the risk of removing breathing space inside conversations.
 
 ---
 
 ## The pipeline
 
-`dnd-cut.sh:20` (`dnd-cut()`) runs the stages in order. The very first
-line of the function sets `trap 'dnd-pause-on-exit' EXIT` so even early
-validation errors get a clean prompt before the script exits.
+`dnd-cut.sh:22` (`dnd-cut()`) runs the stages in order.
 
 | # | Stage | Component | Output |
 |---|---|---|---|
@@ -177,36 +223,46 @@ validation errors get a clean prompt before the script exits.
 | 2 | Create workspace | `workspace.sh` | `<input-dir>/<basename>.dnd-cut/` |
 | 3 | ffprobe metadata | `metadata.sh` | `analysis/metadata.json` |
 | 4 | Extract mono 16 kHz wav | `audio.sh` | `analysis/audio.wav` |
-| 5 | WebRTC VAD | `vad.sh` | `analysis/vad.json` |
-| 6 | Whisper word-timestamp transcription | `whisper.sh` | `analysis/audio.json` |
-| 7 | Classify timeline, build edit list | `timeline.sh` → `python/timeline.py` | `analysis/timeline.json` + `analysis/segments.json` |
-| 8 | Render final cut | `renderer.sh` | `final.mp4` |
-| 9 | Print summary | `finalize.sh` | stdout |
+| 5 | ffmpeg `silencedetect` | `silence.sh` | `analysis/silence.json` |
+| 6 | WebRTC VAD | `vad.sh` | `analysis/vad.json` |
+| 7 | Whisper word-timestamp transcription | `whisper.sh` | `analysis/audio.json` |
+| 8 | Conservative timeline + edit list | `timeline.sh` → `python/timeline.py` | `analysis/timeline.json` + `analysis/segments.json` |
+| 9 | Expand-only refine | `refine.sh` → `python/refine.py` | `analysis/timeline.refined.json` |
+| 10 | Render final cut | `renderer.sh` | `final.mp4` |
+| 11 | Print summary | `finalize.sh` | stdout |
 
 ---
 
 ## Configuration
 
 All knobs live in `components/config.sh` and can be overridden at invocation
-time, e.g. `DND_PRE_ROLL=0.5 dnd-cut talk.mp4`. The defaults are tuned for
-"natural-paced interview/talk" content.
+time, e.g. `DND_SPEECH_END_PADDING=1.0 dnd-cut talk.mp4`. The defaults are
+tuned for **preservation over compression** and assume D&D-style content
+with a mix of loud and quiet speakers.
 
-- **Pre/post roll** adds a small cushion of audio around every kept speech
-  region so cuts don't chop breaths or trailing consonants.
-- **`MIN_REMOVE_DURATION`** is the silence floor — cutting a 200 ms pause
-  is rarely worth the splice artifact, so it stays. Set to `0` to cut
-  everything.
-- **`MIN_KEEP_SILENCE_S`** is a hard floor below which a silence is *always*
-  preserved (breaths, think pauses). Defaults to `0.30`. Together with
-  `MIN_REMOVE_DURATION`, this forms a "soft / hard silence" tier:
-  `< MIN_KEEP_SILENCE_S` → always keep ·
-  `MIN_KEEP_SILENCE_S … MIN_REMOVE_DURATION` → keep ·
-  `≥ MIN_REMOVE_DURATION` → cut.
-- **`MIN_SPEECH_DURATION`** drops speech regions shorter than this
-  (Whisper occasionally hallucinates a one-word blip).
-- **`SPEECH_KEEP_THRESHOLD`** filters out low-confidence Whisper words
-  (hallucinated "thanks for watching" type artifacts). Lower it to keep
-  more; raise it to be more aggressive about ignoring Whisper noise.
+- **Padding** (`SPEECH_START_PADDING` / `SPEECH_END_PADDING`) keeps a
+  cushion of audio around every speech region. Larger = safer. Defaults
+  are deliberately conservative (0.60 / 0.70 s).
+- **`WORD_BOUNDARY_SAFETY_S`** is a defensive guard: cuts are never
+  placed within this many seconds of any Whisper word, no matter what
+  the padding or refiner did. Default 0.30 s.
+- **`MIN_REMOVE_DURATION`** is the silence floor for removal. Below
+  this, gaps are ALWAYS kept. Default 4 s — long enough that real
+  pauses (breaths, thinking) survive, short enough that obvious dead
+  time goes away.
+- **`MIN_KEEP_SILENCE_S`** is a hard floor specifically against
+  aggressive cutting of natural conversational pauses. Defaults to
+  1.0 s.
+- **`MERGE_GAP_S`** controls when nearby speech regions are merged
+  into one conversational segment. Default 1.5 s — two bursts
+  separated by less than this are treated as one thought.
+- **`MIN_SPEECH_DURATION`** drops speech regions shorter than this.
+  Default 0.25 s — short enough that a one-word reply ("No.")
+  survives, long enough to drop truly tiny blips.
+- **`SPEECH_KEEP_THRESHOLD`** is now only used for *labelling* the
+  speech_confidence field. It is no longer used to filter out
+  Whisper words — every word contributes to a speech interval
+  regardless of confidence.
 
 ---
 
@@ -217,11 +273,12 @@ time, e.g. `DND_PRE_ROLL=0.5 dnd-cut talk.mp4`. The defaults are tuned for
 ├── analysis/
 │   ├── metadata.json          # ffprobe dump
 │   ├── audio.wav              # 16 kHz mono PCM, used by VAD + Whisper
+│   ├── silence.json           # ffmpeg silencedetect regions [{start,end,duration}, ...]
 │   ├── vad.json               # WebRTC VAD regions  [{start,end}, ...]
 │   ├── audio.json             # Whisper word-timestamp output
 │   ├── segments.json          # every classified region in the video
-│   └── timeline.json          # edit list (timeline[]) + questionable list
-│                              # + summary; this IS the final plan
+│   └── timeline.json          # edit list + summary + words + silence inputs
+│                              # + refiner output (timeline.refined.json)
 ├── final.mp4                  # the cut output
 └── logs/
     ├── dnd-YYYY-MM-DDTHH-MM-SS.log
@@ -238,33 +295,33 @@ The `timeline.json` schema is:
 {
   "duration": 600.123,
   "timeline": [
-    { "id": 0, "start": 0.5,  "end": 12.7,  "duration": 12.2,
-      "classification": "speech", "speech_confidence": 1.0,
-      "action": "keep", "review_required": false,
-      "reason": "Confirmed speech (Whisper) with padding" },
-    { "id": 1, "start": 12.7, "end": 14.3,  "duration": 1.6,
+    { "id": 0, "start": 0.0,  "end": 0.4,  "duration": 0.4,
       "classification": "gap",    "speech_confidence": 0.0,
+      "action": "keep", "review_required": false,
+      "reason": "Gap shorter than MIN_REMOVE_DURATION (4.00s); kept to preserve natural conversational pacing." },
+    { "id": 1, "start": 0.4,  "end": 12.7, "duration": 12.3,
+      "classification": "speech", "speech_confidence": 0.95,
+      "action": "keep", "review_required": false,
+      "reason": "Speech/activity region with safety padding" },
+    { "id": 2, "start": 12.7, "end": 31.4, "duration": 18.7,
+      "classification": "gap",   "speech_confidence": 0.0,
       "action": "remove", "review_required": false,
-      "reason": "Non-speech gap between kept speech regions" }
+      "reason": "Long quiet gap with no VAD/Whisper activity (>= 4.00s)." }
   ],
-  "questionable": [
-    { "id": 17, "start": 49.4, "end": 49.75, "duration": 0.35,
-      "classification": "possible_speech", "speech_confidence": 0.5,
-      "action": "remove", "review_required": true,
-      "reason": "Speech-like audio without transcribed text" }
-  ],
+  "words": [ /* all Whisper words used for word-boundary safety */ ],
   "summary": {
-    "keep_seconds": 420.0,
-    "remove_seconds": 180.0,
-    "review_segments": 12,
-    "remove_segments": 9,
-    "keep_segments": 24
+    "keep_seconds": 420.0, "remove_seconds": 180.0,
+    "keep_segments": 24,   "remove_segments": 9,
+    "silence_inputs": 12,  "vad_regions": 40, "whisper_words": 1200
+  },
+  "inputs": {
+    "silence_regions": [/* ffmpeg silencedetect output */]
   }
 }
 ```
 
-The `questionable` array is preserved for inspection/debugging (so you can
-see what was cut), but it no longer drives any user-facing step.
+The `questionable` array from earlier versions is gone: there is no
+longer any "auto-remove VAD-only" path, so the concept doesn't apply.
 
 ---
 
@@ -275,13 +332,14 @@ If `dnd-has-state` finds `analysis/audio.json` (Whisper done) or
 
 - **`r` — Resume** — reuse analysis + timeline, just re-render the final
   cut. Fastest path when only the render itself is missing or stale.
-- **`t` — Rebuild timeline** — drop `final.mp4` and `analysis/timeline.json`.
-  Keep `audio.wav`, `vad.json`, `audio.json`. Use this when thresholds like
-  `DND_PRE_ROLL` or `DND_MIN_REMOVE_DURATION` need tweaking without
-  re-paying the Whisper cost.
+- **`t` — Rebuild timeline** — drop `final.mp4` and `analysis/timeline.json`
+  + `timeline.refined.json`. Keep `audio.wav`, `vad.json`, `audio.json`,
+  `silence.json`. Use this when thresholds like `DND_SPEECH_END_PADDING`
+  or `DND_MIN_REMOVE_DURATION` need tweaking without re-paying the
+  Whisper cost.
 - **`a` — Re-analyze** — same as `t` plus drop the audio extraction and
-  the VAD/Whisper outputs. Use this when the input file changed or you
-  want different Whisper output.
+  the VAD/Whisper/silencedetect outputs. Use this when the input file
+  changed or you want different Whisper output.
 - **`f` — Fresh start** — nuke the entire workspace and start over.
 
 Setting `DND_AUTO_RESUME=yes` skips the prompt and defaults to `r`.
@@ -304,16 +362,19 @@ path; otherwise it falls back to the default stream-copy path.
 
 The stream-copy path places `-ss` and `-to` *after* `-i` (output seek). For
 MP4 sources ffmpeg uses the container's packet index to seek to the exact
-packet at `<start>` and stops at the last packet with PTS `<= end`, so cuts
-land at the nearest packet boundary rather than the previous keyframe. This
-means adjacent segments do **not** overlap, with no re-encoding and no quality
-loss. (For sources without a seekable index — rare for `.mp4` — the seek may
-fall back to a keyframe snap; if you hit that, use `DND_RENDER_MODE=reencode`.)
+packet at `<start>` and stops at the last packet with PTS `<= end`.
 
-Either path then joins all `seg_*.mp4` with the concat demuxer:
+**Keyframe snap direction (safety):** with
+`DND_RENDER_BACKWARD_KEYFRAME_SNAP=1` (default), each segment's start is
+snapped to the *previous* keyframe, not the next. This can only ADD audio
+to the segment — it can never consume pre-roll. Set to `0` to revert to
+the legacy forward-snap direction (unsafe for word boundaries; only use
+if you know what you're doing).
+
+The path joins all `seg_*.mp4` with the concat demuxer:
 `ffmpeg -f concat -safe 0 -i <list.txt> -c copy -fflags +genpts -movflags +faststart <output>`.
-`-fflags +genpts` regenerates PTS across segments so audio and video stay in
-sync.
+`-fflags +genpts` regenerates PTS across segments so audio and video stay
+in sync.
 
 If the concat fails for any reason, the renderer falls back to copying the
 original as the output with a warning — the workspace and segment files are
@@ -322,12 +383,6 @@ preserved for inspection.
 Per-segment files (`seg_*.mp4` + `concat.txt`) are kept in `<ws>/.segments/`
 by default. Set `DND_KEEP_SEGMENTS=0` to delete them after a successful
 render.
-
-This is dramatically faster than the previous re-encode + filter_complex
-strategy and avoids the filter-graph length limit (concat demuxer has no
-such ceiling — a video with thousands of keep-segments works fine). The
-trade-off is that cuts are keyframe-snapped rather than frame-accurate,
-which is invisible for most interview/talk content.
 
 ---
 
@@ -351,7 +406,7 @@ proper prompt before exiting.
 
 System:
 
-- `ffmpeg`, `ffprobe` (rendering, audio extraction, probing)
+- `ffmpeg`, `ffprobe` (rendering, audio extraction, probing, `silencedetect`)
 - `jq` (timeline JSON manipulation)
 - `python3` (driver; the heavy lifting goes through the venv)
 
@@ -368,84 +423,54 @@ Python venv (`$BASH_ALIASES_VENV_BIN`, default
 
 ---
 
-## Limitations & known caveats
+## Testing
 
-- **Whisper quality dominates.** On music, SFX, or non-speech content the
-  transcript is mostly noise, every region becomes `vad_only` or
-  `silence`, and you'll cut the entire video down to almost nothing. Run
-  the pipeline on a representative sample before trusting it on a whole
-  catalog.
-- **Per-segment re-encode runs as many parallel ffmpeg jobs as cores.** On a
-  machine with thousands of keep-segments the per-segment ffmpeg startup
-  cost dominates. `DND_RENDER_THREADS` (default = `nproc`, capped at 16)
-  bounds the parallelism.
-- **No GPU memory detection.** `DND_WHISPER_DEVICE=cuda` will hard-fail on
-  machines without a working CUDA stack. Set `DND_WHISPER_DEVICE=cpu` to
-  fall back.
-- **Pre/post roll assumes the speech region is centered in a wider
-  silence.** For rapid back-and-forth dialogue, padding can overlap between
-  adjacent speech regions; the timeline builder de-overlaps by merging, so
-  cuts remain clean but the effective padding is reduced.
-- **The resume prompt is single-keystroke.** There's no default-on-Enter
-  — you must explicitly press `r`, `t`, `a`, or `f`. Setting
-  `DND_AUTO_RESUME=yes` makes `r` the default and skips the prompt entirely.
-- **No batch mode.** Each input is processed in its own workspace and its
-  own dnd-cut invocation. Wrap it in a shell loop if you need to process
-  many files.
-- **No review step.** If the automatic cut is wrong (e.g. you wanted to
-  keep a breath that VAD flagged and Whisper missed), you have to either
-  re-run with different `DND_*` thresholds or hand-edit the final video in
-  a traditional editor. There is no in-pipeline "did you mean to keep
-  this?" prompt.
+Tests live under `tests/` and run with the standard library only:
+
+```bash
+python3 tests/run_tests.py                 # plain runner
+python3 -m unittest discover -s tests      # unittest discovery
+```
+
+The fixtures (`tests/fixtures.py`) generate synthetic VAD regions,
+Whisper words, and silence-detect regions in-memory and invoke
+`python/timeline.py` as a subprocess. Audio-only stages (refine) get a
+synthetic 16 kHz mono wav via `numpy`.
+
+The test suite covers the seven scenarios from the brief (long empty
+space, short conversational pause, quiet speaker, word boundary,
+multi-speaker conversation, background noise, long silence after
+speech) plus edge cases:
+
+- Intro/outro preservation.
+- Pure silence (single remove segment).
+- Missing / malformed `silence.json` (graceful fallback).
+- Short gap (below MIN_REMOVE_DURATION) is never removed.
+- Refiner never shrinks a keep region toward speech.
+
+If you change anything in `python/timeline.py` or `python/refine.py`,
+run the tests. New behavior should come with new tests.
 
 ---
 
-## Future improvements (not yet implemented)
+## Limitations & known caveats
 
-These are the real "editor intelligence" features the pipeline is missing
-today. They're listed honestly so it's clear what's possible vs what's rule-based:
-
-- **Speaker diarization** — Who is speaking when. The pipeline currently has
-  no concept of speakers, so it can't cut *at* speaker changes (often the
-  best cut point in a multi-host conversation), and it can't tell whether
-  the content of two adjacent `vad_only` regions belongs to the same
-  voice. The Python ecosystem has solid options (`pyannote.audio`,
-  `whisperX`) that bolt on cleanly once we wire them up. Cost: adds a
-  heavy GPU/CPU step and a third JSON to the analysis pipeline.
-- **Sentence-boundary cut preference** — Right now cuts land in silence
-  whenever the silence is long enough. A stronger heuristic would prefer
-  cuts that *also* align with sentence boundaries (after `.`, `?`, `!`),
-  since those are where a speaker would naturally pause anyway. Whisper
-  word tokens already carry punctuation, so this is a few lines in
-  `timeline.py` — it's a quality-of-life improvement, not a real
-  intelligence jump.
-- **Soft audio crossfades at cut points** — The current renderer
-  concatenates segments with hard cuts. A 10–50 ms audio crossfade on
-  each side of every cut makes the transition imperceptible. The catch:
-  crossfades require re-encoding, which on CPU is the very thing we made
-  the stream-copy path to avoid. Would live behind a new
-  `DND_RENDER_MODE=reencode-softcut` value (or similar) and would
-  require NVIDIA or a lot of patience.
-- **Cross-talk / overlap detection** — When two people talk over each
-  other, Whisper transcribes the louder one and tags the region as
-  `vad_only`, so the softer voice gets cut. There's no clean fix without
-  speaker diarization first (you need to know it's a *second voice*,
-  not background noise). Falls out for free once the first item above is
-  in.
-
-None of these are blocked; they're each maybe 100–300 lines of work plus
-testing. Flagging them because the user feedback that prompted this
-section ("recognize voices", "match words", "multiple people") is
-fundamentally about these features, not about tuning more dials.
-
-## Exit codes
-
-| Code | Meaning |
-|---|---|
-| `0` | Success |
-| `1` | Bad usage / missing input / missing dependency |
-| `130` | Interrupted (SIGINT or SIGTERM) — workspace preserved, safe to re-run |
-
-The `EXIT` trap is the single source of truth for the final user-facing
-message; the rendered exit code is whatever the underlying command produced
-plus 128 for signal-driven exits.
+- **Whisper quality dominates.** On music, SFX, or non-speech content the
+  transcript is mostly noise and the pipeline will tend to keep
+  everything (which is the safer default).
+- **No speaker diarization.** Two people talking over each other is
+  still hard to model. Whisper transcribes the louder voice; the softer
+  voice may be classified as `vad_only` and is now *kept* (safer than
+  the old behaviour of cutting it).
+- **No GPU memory detection.** `DND_WHISPER_DEVICE=cuda` will hard-fail
+  on machines without a working CUDA stack. Set `DND_WHISPER_DEVICE=cpu`
+  to fall back.
+- **No review step.** If the automatic cut is wrong, re-run with
+  different `DND_*` thresholds or hand-edit `timeline.json` /
+  `timeline.refined.json` and re-render with `[r]`.
+- **Resume prompt is single-keystroke.** No default-on-Enter — you
+  must explicitly press `r`, `t`, `a`, or `f`. Setting
+  `DND_AUTO_RESUME=yes` makes `r` the default.
+- **No batch mode.** Each input gets its own workspace and dnd-cut
+  invocation. Wrap it in a shell loop if you need to process many
+  files.

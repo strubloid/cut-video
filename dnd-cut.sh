@@ -11,6 +11,7 @@ source "$CUT_VIDEO_ROOT/components/dependencies.sh"
 source "$CUT_VIDEO_ROOT/components/workspace.sh"
 source "$CUT_VIDEO_ROOT/components/metadata.sh"
 source "$CUT_VIDEO_ROOT/components/audio.sh"
+source "$CUT_VIDEO_ROOT/components/silence.sh"
 source "$CUT_VIDEO_ROOT/components/vad.sh"
 source "$CUT_VIDEO_ROOT/components/whisper.sh"
 source "$CUT_VIDEO_ROOT/components/timeline.sh"
@@ -65,9 +66,14 @@ function dnd-cut() {
   dnd-extract-audio "$input" "$wav"
 
   if [[ "$mode" == "fresh" || "$mode" == "reanalyze" ]]; then
-    dnd-run-vad      "$wav" "$ws/analysis/vad.json"
-    dnd-run-whisper  "$wav" "$ws/analysis"
+    dnd-run-silence-detect "$wav" "$ws/analysis/silence.json"
+    dnd-run-vad            "$wav" "$ws/analysis/vad.json"
+    dnd-run-whisper        "$wav" "$ws/analysis"
   else
+    if ! dnd-valid-json "$ws/analysis/silence.json"; then
+      rm -f "$ws/analysis/silence.json"
+      dnd-run-silence-detect "$wav" "$ws/analysis/silence.json"
+    fi
     if ! dnd-valid-json "$ws/analysis/vad.json"; then
       rm -f "$ws/analysis/vad.json"
       dnd-run-vad "$wav" "$ws/analysis/vad.json"

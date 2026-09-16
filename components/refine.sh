@@ -6,14 +6,14 @@ function dnd-refine-cuts() {
   local plan_json="$ws/analysis/timeline.json"
   local refined_json="$ws/analysis/timeline.refined.json"
   local audio_wav="$ws/analysis/audio.wav"
-  local snap_window="${DND_SNAP_WINDOW_S:-0.5}"
-  local audio_window="${DND_AUDIO_SNAP_WINDOW_S:-0.2}"
+  local word_safety="${DND_REFINE_WORD_SAFETY_S:-0.30}"
+  local extend="${DND_REFINE_EXTEND_WINDOW_S:-0.25}"
 
-  dnd-log "Refining cut points (scene snap window=${snap_window}s, audio window=${audio_window}s)..."
+  dnd-log "Refining cut points (word safety=${word_safety}s, outward extend=${extend}s, expand-only)..."
 
   "${BASH_ALIASES_VENV_BIN}/python" \
     "$CUT_VIDEO_ROOT/python/refine.py" \
-    --snap-window  "$snap_window" \
-    --audio-window "$audio_window" \
-    "$plan_json" "$refined_json" "$audio_wav" "$input"
+    --word-boundary-safety "$word_safety" \
+    --extend-window        "$extend" \
+    "$plan_json" "$refined_json" "$audio_wav"
 }
