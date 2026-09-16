@@ -19,7 +19,7 @@ export DND_SPEECH_END_PADDING="${DND_SPEECH_END_PADDING:-$DND_POST_ROLL}"
 # MERGE_GAP_S controls when nearby speech regions are merged into one
 # conversational segment.
 # ---------------------------------------------------------------------------
-export DND_MIN_REMOVE_DURATION="${DND_MIN_REMOVE_DURATION:-4.00}"
+export DND_MIN_REMOVE_DURATION="${DND_MIN_REMOVE_DURATION:-2.00}"
 export DND_MIN_KEEP_SILENCE_S="${DND_MIN_KEEP_SILENCE_S:-1.00}"
 export DND_MERGE_GAP_S="${DND_MERGE_GAP_S:-1.50}"
 
