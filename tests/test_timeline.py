@@ -476,17 +476,16 @@ class TestNoMakeZeroRegression(unittest.TestCase):
 
 
 class TestAudioFrameCapRegression(unittest.TestCase):
-    """Regression test for the 'bummmm' artifact at cut boundaries.
+    """Regression test for the 'bummmm' artifact at cut boundaries AND
+    for the lip-sync drift that used to accumulate across segments.
 
-    ffmpeg's stream-copy + output seek always includes the AAC frame
-    that straddles the requested `-ss` time. That frame sits one
-    frame BEFORE the seek point and creates a pre-roll that, after
-    concat with the previous segment, causes a brief loud burst of
-    stacked audio at the cut.
-
-    The renderer now caps each segment's audio with `-frames:a N`,
-    where N is computed from the segment duration and the source's
-    sample rate. This drops the pre-roll frame.
+    The renderer caps each segment's re-encoded audio with `-frames:a N`
+    where N is `floor(segment_duration * sr / framesize)`. The FLOOR
+    rounding (no `+1.5` fudge as in earlier versions) is the key:
+    it guarantees the audio track ends at or before the last video
+    frame, so audio never spills over into the next segment's video
+    at the concat boundary — which is what produced the cumulative
+    lip-sync drift the user reported.
 
     This test guards the formula for computing N.
     """
@@ -513,12 +512,12 @@ class TestAudioFrameCapRegression(unittest.TestCase):
                           check=True, capture_output=True)
 
             for start, end, expected_n in [
-                (0, 22.955, 1077),
-                (5.0, 20.0, 704),
-                (0.5, 1.5, 48),
+                (0,    22.955, 1076),
+                (5.0,  20.0,    703),
+                (0.5,  1.5,      46),
             ]:
-                # Formula from renderer.sh
-                n = int((end - start) * sr / 1024 + 1.5)
+                # Formula from renderer.sh: floor, NO `+1.5` fudge.
+                n = int((end - start) * sr / 1024)
                 self.assertEqual(n, expected_n,
                     f'formula mismatch for [{start}, {end}]')
                 # Extract with -frames:a N

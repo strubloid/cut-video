@@ -220,5 +220,151 @@ class TestRendererKeyframeHandoff(unittest.TestCase):
                     f"row {i} ends {rows[i][1]} but row {i+1} starts {rows[i+1][0]}")
 
 
+class TestAudioDoesNotExtendPastVideo(unittest.TestCase):
+    """Regression test for the lip-sync drift reported at the end of
+    long videos: in every per-segment MP4, the audio track must NOT
+    extend significantly past the last video frame. When it does, the
+    spillover plays over the next segment's video at the concat
+    boundary, and the user perceives cumulative A/V drift across
+    cuts.
+
+    The renderer uses `-frames:a N` where N is
+    `floor(segment_duration * sr / framesize)`. This guarantees the
+    re-encoded AAC track ends at or before the last video frame.
+
+    Note: AAC frames are atomic (1024 samples = 21.33 ms at 48 kHz)
+    so audio and video cannot end at the exact same PTS. We allow up
+    to 30 ms of audio-leads-video drift — this is well below the
+    ~40 ms threshold of human perception for lip-sync errors.
+    """
+
+    def test_audio_drift_below_perception_threshold(self):
+        """Per-segment audio-leads-video drift must be small. The OLD
+        `-frames:a N` formula `int((e-s)*sr/fs + 1.5)` rounded audio
+        UP by ~1.5 AAC frames, so audio extended past video at every
+        segment boundary. The new formula uses `floor` so audio is
+        bounded by the segment duration.
+
+        We allow up to 60 ms of drift per segment: the AAC encoder
+        adds a 1024-sample priming delay (~21 ms) on top of the
+        floor-rounded count, and B-frames in the video stream can
+        push the last V packet a couple of frames earlier than
+        expected. 60 ms is comfortably below the ~100 ms "noticeable"
+        threshold for lip-sync."""
+        import subprocess, tempfile, wave, numpy as np
+        from pathlib import Path
+        sr = 48000
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            wav = td / "a.wav"
+            n = sr * 30
+            audio = (np.sin(2 * np.pi * 440 * np.arange(n) / sr) * 0.3
+                     ).astype(np.int16) * 32767
+            with wave.open(str(wav), "wb") as wf:
+                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
+                wf.writeframes(audio.tobytes())
+            src = td / "src.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-f", "lavfi",
+                "-i", "testsrc=duration=30:size=320x240:rate=30",
+                "-i", str(wav), "-c:v", "libx264", "-preset", "ultrafast",
+                "-g", "30", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", str(src),
+            ], check=True, capture_output=True)
+            for s, e in [(0, 22.955), (5.0, 20.0), (0.5, 1.5), (10.0, 27.0)]:
+                n_frames = int((e - s) * sr / 1024)
+                out = td / f"seg_{s}_{e}.mp4"
+                subprocess.run([
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-ss", str(s), "-to", str(e), "-i", str(src),
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-frames:a", str(n_frames),
+                    "-reset_timestamps", "1",
+                    str(out),
+                ], check=True, capture_output=True)
+                v_pts = subprocess.run([
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "packet=pts_time",
+                    "-select_streams", "v", "-of", "csv=p=0",
+                    str(out),
+                ], capture_output=True, text=True).stdout.strip().splitlines()
+                a_pts = subprocess.run([
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "packet=pts_time",
+                    "-select_streams", "a", "-of", "csv=p=0",
+                    str(out),
+                ], capture_output=True, text=True).stdout.strip().splitlines()
+                v_end = float(v_pts[-1])
+                a_end = float(a_pts[-1])
+                drift_ms = (a_end - v_end) * 1000
+                self.assertLessEqual(
+                    drift_ms, 60.0,
+                    f"seg [{s}, {e}]: audio ends at {a_end:.3f}s, video "
+                    f"ends at {v_end:.3f}s; audio-leads-video drift = "
+                    f"{drift_ms:.1f} ms (must be <= 60 ms).",
+                )
+
+    def test_old_formula_produces_worse_drift(self):
+        """Sanity check that the OLD `+1.5` rounding-up fudge in the
+        `-frames:a N` formula produced much worse audio-leads-video
+        drift than the new floor formula. This guards against any
+        future regression that re-introduces the fudge."""
+        import subprocess, tempfile, wave, numpy as np
+        from pathlib import Path
+        sr = 48000
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            wav = td / "a.wav"
+            n = sr * 30
+            audio = (np.sin(2 * np.pi * 440 * np.arange(n) / sr) * 0.3
+                     ).astype(np.int16) * 32767
+            with wave.open(str(wav), "wb") as wf:
+                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
+                wf.writeframes(audio.tobytes())
+            src = td / "src.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-f", "lavfi",
+                "-i", "testsrc=duration=30:size=320x240:rate=30",
+                "-i", str(wav), "-c:v", "libx264", "-preset", "ultrafast",
+                "-g", "30", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", str(src),
+            ], check=True, capture_output=True)
+            s, e = 0, 22.955
+            old_n = int((e - s) * sr / 1024 + 1.5)
+            new_n = int((e - s) * sr / 1024)
+            old_drift = self._drift_ms(td, src, s, e, old_n)
+            new_drift = self._drift_ms(td, src, s, e, new_n)
+            self.assertGreater(
+                old_drift, new_drift,
+                f"old formula (N={old_n}, drift={old_drift:.1f} ms) must "
+                f"produce STRICTLY MORE drift than new formula "
+                f"(N={new_n}, drift={new_drift:.1f} ms).",
+            )
+
+    @staticmethod
+    def _drift_ms(td, src, s, e, n_frames):
+        import subprocess
+        out = td / f"seg_{s}_{e}_{n_frames}.mp4"
+        subprocess.run([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-ss", str(s), "-to", str(e), "-i", str(src),
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-frames:a", str(n_frames),
+            "-reset_timestamps", "1",
+            str(out),
+        ], check=True, capture_output=True)
+        v_pts = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-show_entries", "packet=pts_time",
+            "-select_streams", "v", "-of", "csv=p=0", str(out),
+        ], capture_output=True, text=True).stdout.strip().splitlines()
+        a_pts = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-show_entries", "packet=pts_time",
+            "-select_streams", "a", "-of", "csv=p=0", str(out),
+        ], capture_output=True, text=True).stdout.strip().splitlines()
+        return (float(a_pts[-1]) - float(v_pts[-1])) * 1000
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

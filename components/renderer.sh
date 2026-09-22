@@ -67,12 +67,17 @@ function dnd-render-stream-copy() {
   fi
   local n_kf=0
   [[ -s "$kf_file" ]] && n_kf=$(wc -l < "$kf_file")
-  dnd-log "Stream-copy (backward keyframe snap + overlap clip + audio frame cap)"
+  dnd-log "Stream-copy (backward keyframe snap + overlap clip + reset_timestamps + audio frame count cap)"
 
   # Probe audio: get sample rate so we can compute exact audio-frame
-  # counts per segment. ffmpeg's `-frames:a N` is the only reliable
-  # way to drop the pre-roll audio frame that stream-copy otherwise
-  # includes from before the requested `-ss` time.
+  # counts per segment. The audio re-encoder's `-frames:a N` cap is the
+  # only way to control where the audio track of each segment ENDS.
+  # We pick N such that audio duration is at most the segment duration,
+  # so audio never spills over into the next segment's video at the
+  # concat boundary — which is what causes the cumulative lip-sync
+  # drift the user reported. (`+1.5` would round UP and let audio
+  # extend past video; we round DOWN so audio ends at or before the
+  # last video frame.)
   local audio_sr=48000
   local audio_framesize=1024
   local probe_out
@@ -92,7 +97,7 @@ function dnd-render-stream-copy() {
   # ---------------------------------------------------------------------
   # Pass 1: compute (actual_start, actual_end) for every keep range,
   # guaranteeing adjacent segments never overlap in source range.
-  # Also compute exact audio frame counts.
+  # Also compute exact audio frame counts (see note above).
   # ---------------------------------------------------------------------
   local ranges_file="$seg_dir/ranges.tsv"
   local backward_snap=1
@@ -131,25 +136,34 @@ function dnd-render-stream-copy() {
       continue
     fi
 
-    # Compute exact audio frame count for this segment. ffmpeg's
-    # stream-copy mode includes the AAC frame that straddles the
-    # requested `-ss` time (it sits one frame before the seek
-    # point). `-frames:a N` is the only reliable way to drop that
-    # pre-roll frame and avoid the "bummmm" artifact when the
-    # previous segment's tail audio overlaps with it.
-    #
-    # `-frames:a` is honoured by ffmpeg's decoder/encode pipeline
-    # but NOT by stream copy on the audio track. So we have to
-    # re-encode audio (cheap: ~10× realtime for AAC). Video stays
-    # stream copy.
+    # Compute exact audio frame count for this segment. We use FLOOR
+    # (not the previous `+1.5` rounding-up fudge) so the audio track
+    # is guaranteed to end at or before the last video frame. Any
+    # audio that extended past the last video frame would be heard
+    # over the next segment's video at the concat boundary — the
+    # source of the user's lip-sync drift.
     local n_frames
     n_frames=$(awk -v s="$actual_start" -v e="$actual_end" \
                      -v sr="$audio_sr" -v fs="$audio_framesize" \
-                     'BEGIN { printf("%d\n", int((e - s) * sr / fs + 1.5)) }')
+                     'BEGIN { printf("%d\n", int((e - s) * sr / fs)) }')
 
     local seg_file="$seg_dir/seg_$(printf '%05d' "$i").mp4"
     (
       # Video stream-copy; audio re-encode with frame-count cap.
+      #
+      # `-reset_timestamps 1` makes both A and V start at PTS=0 in
+      # every segment file. This is the key fix for the lip-sync
+      # drift: without it, V starts at the previous keyframe's PTS
+      # (after backward snap) which is typically 1-3 seconds before
+      # A's start. When concat'd, that pre-roll is preserved and the
+      # user perceives it as A and V drifting apart over time.
+      #
+      # `-frames:a N` (with the floor-rounded N computed above) caps
+      # the re-encoded audio so it never extends past the last video
+      # frame in the segment. The audio encoder would otherwise
+      # produce a few extra samples (~21 ms = one AAC frame at 48 kHz)
+      # past the segment boundary because AAC frames are atomic.
+      #
       # Do NOT pass `-avoid_negative_ts make_zero`: with MP4 +
       # B-frames + stream-copy, that flag causes ffmpeg to include
       # ~50 extra audio packets past the requested `-to` boundary,
@@ -160,6 +174,7 @@ function dnd-render-stream-copy() {
         -ss "$actual_start" -to "$actual_end" -i "$input" \
         -c:v copy -c:a aac -b:a "$DND_AUDIO_BITRATE" \
         -frames:a "$n_frames" \
+        -reset_timestamps 1 \
         "$seg_file" 2>/dev/null
     ) &
     DND_RENDER_PIDS+=($!)
@@ -265,18 +280,35 @@ function dnd-render-reencode() {
       DND_RENDER_PIDS=("${DND_RENDER_PIDS[@]:1}")
     done
 
+    # Compute exact audio frame count for this segment. See the note
+    # in dnd-render-stream-copy for why we FLOOR (no `+1.5` fudge):
+    # we want audio duration ≤ video duration so audio never spills
+    # over into the next segment's video at the concat boundary.
     local n_frames
     n_frames=$(awk -v s="$actual_start" -v e="$actual_end" \
                      -v sr="$audio_sr" -v fs="$audio_framesize" \
-                     'BEGIN { printf("%d\n", int((e - s) * sr / fs + 1.5)) }')
+                     'BEGIN { printf("%d\n", int((e - s) * sr / fs)) }')
 
     local seg_file="$seg_dir/seg_$(printf '%05d' "$i").mp4"
     (
-      # Stream-copy video; re-encode audio with frame-count cap.
+      # Re-encode video + audio with frame-count cap on audio.
+      #
+      # `-reset_timestamps 1` is the key fix for lip-sync drift: it
+      # makes both A and V start at PTS=0 in every segment so the
+      # concat demuxer's `-fflags +genpts` produces a clean output.
+      # Without it, V starts at the previous keyframe's PTS (after
+      # backward snap) which is typically 1-3 s before A's start,
+      # and the user perceives it as cumulative A/V drift.
+      #
+      # `-frames:a N` (with the floor-rounded N computed above) caps
+      # the re-encoded audio so it never extends past the last video
+      # frame in the segment. The audio encoder would otherwise
+      # produce ~21 ms of extra audio past the boundary.
       ffmpeg -y -nostdin -loglevel error \
         -i "$input" -ss "$actual_start" -to "$actual_end" \
         -c:v "$video_codec" -preset "$video_preset" "${quality_flag[@]}" \
         -c:a aac -b:a "$DND_AUDIO_BITRATE" -frames:a "$n_frames" \
+        -reset_timestamps 1 \
         -pix_fmt yuv420p \
         -movflags +faststart \
         "$seg_file" 2>/dev/null
